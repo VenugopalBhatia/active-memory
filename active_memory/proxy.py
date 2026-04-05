@@ -694,21 +694,49 @@ class ContextManager:
         return "█" * filled + "░" * (width - filled)
 
     @staticmethod
-    def _sparkline(values: list[float]) -> str:
-        """Render a compact unicode sparkline for a numeric series."""
-        if not values:
-            return ""
-        ticks = "▁▂▃▄▅▆▇█"
-        lo = min(values)
-        hi = max(values)
-        if hi <= lo:
-            return ticks[0] * len(values)
-        out: list[str] = []
-        for value in values:
-            pos = (value - lo) / (hi - lo)
-            idx = min(len(ticks) - 1, max(0, int(round(pos * (len(ticks) - 1)))))
-            out.append(ticks[idx])
-        return "".join(out)
+    def _usage_chart(
+        raw_values: list[float],
+        sent_values: list[float],
+        markers: list[str],
+        *,
+        max_value: float,
+        height: int = 8,
+    ) -> list[str]:
+        """Render a taller ASCII chart for raw vs sent tokens."""
+        if not raw_values or not sent_values:
+            return []
+
+        n = min(len(raw_values), len(sent_values), len(markers))
+        raw_values = raw_values[-n:]
+        sent_values = sent_values[-n:]
+        markers = markers[-n:]
+        height = max(4, height)
+        max_value = max(1.0, max_value)
+
+        canvas = [[" " for _ in range(n)] for _ in range(height)]
+
+        def to_row(value: float) -> int:
+            ratio = max(0.0, min(1.0, value / max_value))
+            return max(0, min(height - 1, int(round((1.0 - ratio) * (height - 1)))))
+
+        for idx, (raw, sent) in enumerate(zip(raw_values, sent_values)):
+            raw_row = to_row(raw)
+            sent_row = to_row(sent)
+            if raw_row == sent_row:
+                canvas[raw_row][idx] = "◆"
+            else:
+                canvas[raw_row][idx] = "H"
+                canvas[sent_row][idx] = "P"
+
+        lines: list[str] = []
+        for row_idx, row in enumerate(canvas):
+            level = int(round(max_value * (height - 1 - row_idx) / max(1, height - 1)))
+            lines.append(f"  {level:>7,} | {''.join(row)}")
+        lines.append("          +" + "-" * (n + 2))
+        lines.append("           " + "".join(markers))
+        lines.append("           " + "".join("^" if i % 5 == 0 else " " for i in range(n)))
+        lines.append("           Legend: H raw history  P proxy sent  ◆ overlap")
+        return lines
 
     def _record_usage(self, *, action: str, raw_tokens: int, sent_tokens: int) -> None:
         """Persist per-turn usage for the /usage endpoint."""
@@ -752,6 +780,13 @@ class ContextManager:
         recent = self._usage_history[-last_n:]
         raw_values = [float(row["raw_tokens"]) for row in recent]
         sent_values = [float(row["sent_tokens"]) for row in recent]
+        raw_growth = 0.0
+        sent_growth = 0.0
+        if len(recent) >= 2:
+            raw_start = max(1.0, raw_values[0])
+            sent_start = max(1.0, sent_values[0])
+            raw_growth = (raw_values[-1] - raw_values[0]) / raw_start
+            sent_growth = (sent_values[-1] - sent_values[0]) / sent_start
         marker_row = []
         for row in recent:
             marker = "".join(row["events"])
@@ -777,15 +812,25 @@ class ContextManager:
             f"Current mode:  {latest['action']}",
             f"Activation at: {self._activation_turn if self._activation_turn is not None else '-'}",
             f"Reset count:   {resets}",
+            f"Growth ({len(recent):>2} turns): raw {raw_growth:+6.1%}  sent {sent_growth:+6.1%}",
             "",
             "Trend:",
-            f"  raw  {self._sparkline(raw_values)}",
-            f"  sent {self._sparkline(sent_values)}",
-            f"  evt  {''.join(marker_row)}",
+        ]
+
+        lines.extend(
+            self._usage_chart(
+                raw_values,
+                sent_values,
+                marker_row,
+                max_value=float(budget),
+                height=8,
+            )
+        )
+        lines.extend([
             "",
             "Legend: P passthrough  A activation  M managed  R reset  S reset-suppressed",
             "Recent turns:",
-        ]
+        ])
 
         for row in recent:
             ratio = row["sent_tokens"] / max(1, budget)

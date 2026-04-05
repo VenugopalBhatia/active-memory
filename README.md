@@ -118,10 +118,29 @@ Proxy sent:      20,562 tok   46.7% used    23,438 left
 Current mode:    passthrough
 Activation at:   -
 Reset count:     0
+Growth ( 5 turns): raw +59.2%  sent -45.2%
+
+Trend:
+   44,000 |          
+   37,714 |          
+   31,429 |          
+   25,143 |          
+   18,857 |   ◆◆H H  
+   12,571 |      P P◆
+    6,286 |          
+        0 |          
+          +----------
+           PPPPPAAMMR
+           ^    ^    
+           Legend: H raw history  P proxy sent  ◆ overlap
 
 Legend: P passthrough  A activation  M managed  R reset  S reset-suppressed
 Recent turns:
-  t126 ███████████░░░░░░░░░░░░░  20,562/44,000 (46.7%)  raw= 20,562  P
+  t121 ███████████░░░░░░░░░░░░░  19,604/44,000 (44.6%)  raw= 19,604  saved=      0  P
+  t122 ███████████░░░░░░░░░░░░░  20,562/44,000 (46.7%)  raw= 20,562  saved=      0  P
+  t123 █████████████░░░░░░░░░░░  23,418/44,000 (53.2%)  raw= 23,418  saved=      0  A
+  t124 ████████░░░░░░░░░░░░░░░░  14,102/44,000 (32.0%)  raw= 24,887  saved= 10,785  M
+  t125 ███████░░░░░░░░░░░░░░░░░  12,844/44,000 (29.2%)  raw= 31,204  saved= 18,360  R
 ```
 
 ## CLI options
