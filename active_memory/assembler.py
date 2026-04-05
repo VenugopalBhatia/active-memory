@@ -25,28 +25,28 @@ from .types import Embedding, KVTuple, cosine_sim, estimate_tokens
 
 @dataclass
 class AssemblerConfig:
-    total_budget: int = 100_000       # max tokens for the full prompt
-    pinned_reserve: int = 8_000       # tokens reserved for pinned content
-    recency_window: int = 4           # last N conversation turns always kept
-    managed_top_k: int = 200          # max tuples to score from the tree
+    total_budget: int = 18_000        # max tokens for the full prompt
+    pinned_reserve: int = 4_000       # tokens reserved for pinned content
+    recency_window: int = 3           # last N conversation turns always kept
+    managed_top_k: int = 120          # max tuples to score from the tree
 
     # Ground-truth anchoring: force-include tuples with relevance above
     # this threshold, even if their composite score is low.
-    anchor_relevance_threshold: float = 0.60
+    anchor_relevance_threshold: float = 0.62
     # Max tokens to spend on anchored tuples (prevents runaway anchoring)
-    anchor_budget_fraction: float = 0.25
+    anchor_budget_fraction: float = 0.20
 
     # Dependency pulling: include structural neighbors of selected tuples
     dependency_pull: bool = True
     # Max tokens to spend on pulled dependencies
-    dependency_budget_fraction: float = 0.10
+    dependency_budget_fraction: float = 0.08
 
     # Budget pressure: intentionally use LESS than the full budget.
     # A value of 0.6 means "fill only 60% of the available budget."
     # Lower values = shorter context = stronger per-token attention,
     # but higher risk of missing relevant information.
     # Range: 0.3 (very aggressive) to 1.0 (fill everything).
-    budget_pressure: float = 0.85
+    budget_pressure: float = 0.80
 
 
 @dataclass

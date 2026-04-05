@@ -88,7 +88,7 @@ class BTreeConfig:
     max_tuples: int = 16       # max KV tuples per leaf before split
     min_tuples: int = 4        # merge threshold
     min_children: int = 2      # minimum children for internal node
-    compress_threshold: float = 0.08  # score below which a node is cold
+    compress_threshold: float = 0.10  # score below which a node is cold
 
 
 class SemanticBTree:

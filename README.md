@@ -150,17 +150,19 @@ active-memory [OPTIONS]
 
   --port, -p     Port to listen on (default: 8080)
   --host         Bind address (default: 127.0.0.1)
-  --budget       Token budget for managed context (default: 100,000)
-  --recency      Recent turns to always pin (default: 6)
+  --budget       Token budget for managed context (default: 18,000)
+  --recency      Recent turns to always pin (default: 3)
   --embedder     auto | hash | openai (default: auto)
   --embed-model  OpenAI embedding model (default: text-embedding-3-small)
   --embed-dim    Hash embedding dimension (default: 64)
   --upstream     Upstream API URL (default: https://api.anthropic.com)
   --verbose, -v  Print context management diagnostics to stderr
   --state-dir    Directory for proxy state persistence
-  --reset-threshold       Fraction of budget triggering context reset (default: 0.75)
-  --reset-briefing-budget Max tokens for reset briefing (default: 8,000)
+  --reset-threshold       Fraction of budget triggering context reset (default: 0.70)
+  --reset-briefing-budget Max tokens for reset briefing (default: 3,000)
   --reset-recency-turns   Turns to keep verbatim after reset (default: 2)
+  --reset-cooldown-turns  Minimum turns between resets (default: 8)
+  --reset-hysteresis-ratio Required raw-growth fraction before re-reset (default: 0.10)
   --config                Path to JSON config file
 ```
 
@@ -325,15 +327,15 @@ All parameters below can be set via the [config file](#configuration-file) or CL
 
 | Parameter | Config key | Default | Effect |
 |---|---|---|---|
-| `--budget` | `budget` | 100,000 | Total token budget for assembled prompts |
-| `--recency` | `assembler.recency_window` | 6 (proxy) / 4 (chat) | Recent turns always included verbatim |
-| `--reset-threshold` | `proxy.reset_threshold` | 0.75 | Fraction of budget that triggers a full context reset |
-| `--reset-briefing-budget` | `proxy.reset_briefing_budget` | 8,000 | Max tokens for the briefing after a reset |
+| `--budget` | `budget` | 18,000 | Total token budget for assembled prompts |
+| `--recency` | `assembler.recency_window` | 3 | Recent turns always included verbatim |
+| `--reset-threshold` | `proxy.reset_threshold` | 0.70 | Fraction of budget that triggers a full context reset |
+| `--reset-briefing-budget` | `proxy.reset_briefing_budget` | 3,000 | Max tokens for the briefing after a reset |
 | | `btree.max_tuples` | 16 | Tuples per leaf before split |
-| | `btree.compress_threshold` | 0.08 | Score below which subtrees compress |
+| | `btree.compress_threshold` | 0.10 | Score below which subtrees compress |
 | | `scoring.recency_half_life` | 1800 | Half-life in seconds for recency decay |
-| | `assembler.budget_pressure` | 0.85 | Fraction of available budget to actually fill |
-| | `assembler.anchor_relevance_threshold` | 0.60 | Cosine similarity threshold for ground-truth anchoring |
+| | `assembler.budget_pressure` | 0.80 | Fraction of available budget to actually fill |
+| | `assembler.anchor_relevance_threshold` | 0.62 | Cosine similarity threshold for ground-truth anchoring |
 
 ## Current status
 

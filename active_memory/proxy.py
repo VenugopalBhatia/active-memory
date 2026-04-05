@@ -61,20 +61,20 @@ class ProxyConfig:
         self,
         upstream_url: str = "https://api.anthropic.com",
         api_key: str | None = None,
-        token_budget: int = 120_000,
-        pinned_reserve: int = 12_000,
-        recency_window: int = 6,
+        token_budget: int = 18_000,
+        pinned_reserve: int = 4_000,
+        recency_window: int = 3,
         embedder_provider: str = "auto",
         embed_model: str = "text-embedding-3-small",
         embed_dim: int = 64,
         max_tuples: int = 16,
-        prune_interval: int = 5,
-        compress_interval: int = 15,
+        prune_interval: int = 4,
+        compress_interval: int = 8,
         state_dir: str | None = None,
         verbose: bool = False,
         # Context reset settings
-        reset_threshold: float = 0.75,  # reset when raw tokens exceed this fraction of budget
-        reset_briefing_budget: int = 8_000,  # max tokens for the briefing after reset
+        reset_threshold: float = 0.70,  # reset when raw tokens exceed this fraction of budget
+        reset_briefing_budget: int = 3_000,  # max tokens for the briefing after reset
         reset_recency_turns: int = 2,  # conversation turns to keep verbatim after reset
         reset_cooldown_turns: int = 8,  # min turns between resets
         reset_hysteresis_ratio: float = 0.10,  # required raw growth after a reset
@@ -1364,9 +1364,9 @@ Example:
     )
     parser.add_argument("--port", "-p", type=int, default=8080)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--budget", type=int, default=100_000,
+    parser.add_argument("--budget", type=int, default=18_000,
                         help="Token budget for managed context")
-    parser.add_argument("--recency", type=int, default=6,
+    parser.add_argument("--recency", type=int, default=3,
                         help="Number of recent turns to always include")
     parser.add_argument(
         "--embedder",
@@ -1396,13 +1396,13 @@ Example:
     parser.add_argument(
         "--reset-threshold",
         type=float,
-        default=0.75,
+        default=0.70,
         help="Fraction of budget that triggers a full context reset",
     )
     parser.add_argument(
         "--reset-briefing-budget",
         type=int,
-        default=8_000,
+        default=3_000,
         help="Token budget for the reset briefing",
     )
     parser.add_argument(
@@ -1457,15 +1457,15 @@ Example:
 
     config = ProxyConfig(
         upstream_url=_resolve(args.upstream, "https://api.anthropic.com", "upstream"),
-        token_budget=_resolve(args.budget, 100_000, "budget", int),
-        recency_window=_resolve(args.recency, 6, "recency_window", int),
+        token_budget=_resolve(args.budget, 18_000, "budget", int),
+        recency_window=_resolve(args.recency, 3, "recency_window", int),
         embedder_provider=_resolve(args.embedder, "auto", "embedder"),
         embed_model=_resolve(args.embed_model, "text-embedding-3-small", "embed_model"),
         embed_dim=_resolve(args.embed_dim, 64, "embed_dim", int),
         state_dir=_resolve(args.state_dir, None, "state_dir"),
         verbose=args.verbose or file_overrides.get("verbose", False) or proxy_section.get("verbose", False),
-        reset_threshold=_resolve(args.reset_threshold, 0.75, "reset_threshold", float),
-        reset_briefing_budget=_resolve(args.reset_briefing_budget, 8_000, "reset_briefing_budget", int),
+        reset_threshold=_resolve(args.reset_threshold, 0.70, "reset_threshold", float),
+        reset_briefing_budget=_resolve(args.reset_briefing_budget, 3_000, "reset_briefing_budget", int),
         reset_recency_turns=_resolve(args.reset_recency_turns, 2, "reset_recency_turns", int),
         reset_cooldown_turns=_resolve(args.reset_cooldown_turns, 8, "reset_cooldown_turns", int),
         reset_hysteresis_ratio=_resolve(args.reset_hysteresis_ratio, 0.10, "reset_hysteresis_ratio", float),
