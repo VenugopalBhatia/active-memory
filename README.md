@@ -96,7 +96,33 @@ Turn 100+:    Another reset if needed -- the tree keeps growing, conversations s
 | `/v1/messages` | POST | Intercepts and optimises Anthropic API calls |
 | `/health` | GET | Health check + tree stats |
 | `/stats` | GET | Detailed tree and session metrics |
+| `/usage` | GET | Terminal-friendly usage graph with budget, activation, and reset markers |
 | All other paths | POST | Passed through to upstream unchanged |
+
+You can inspect usage live from a terminal:
+
+```bash
+curl http://127.0.0.1:8080/usage
+```
+
+Example output:
+
+```text
+active-memory usage
+Budget:          44,000 tok
+Activation:      22,000 tok
+Reset:           30,800 tok
+
+Raw history:     20,562 tok   46.7% used    23,438 left
+Proxy sent:      20,562 tok   46.7% used    23,438 left
+Current mode:    passthrough
+Activation at:   -
+Reset count:     0
+
+Legend: P passthrough  A activation  M managed  R reset  S reset-suppressed
+Recent turns:
+  t126 ███████████░░░░░░░░░░░░░  20,562/44,000 (46.7%)  raw= 20,562  P
+```
 
 ## CLI options
 

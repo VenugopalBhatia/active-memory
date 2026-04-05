@@ -693,6 +693,23 @@ class ContextManager:
         filled = int(round(value * width))
         return "█" * filled + "░" * (width - filled)
 
+    @staticmethod
+    def _sparkline(values: list[float]) -> str:
+        """Render a compact unicode sparkline for a numeric series."""
+        if not values:
+            return ""
+        ticks = "▁▂▃▄▅▆▇█"
+        lo = min(values)
+        hi = max(values)
+        if hi <= lo:
+            return ticks[0] * len(values)
+        out: list[str] = []
+        for value in values:
+            pos = (value - lo) / (hi - lo)
+            idx = min(len(ticks) - 1, max(0, int(round(pos * (len(ticks) - 1)))))
+            out.append(ticks[idx])
+        return "".join(out)
+
     def _record_usage(self, *, action: str, raw_tokens: int, sent_tokens: int) -> None:
         """Persist per-turn usage for the /usage endpoint."""
         events: list[str] = []
@@ -732,6 +749,22 @@ class ContextManager:
         raw_left = max(0, budget - latest["raw_tokens"])
         sent_left = max(0, budget - latest["sent_tokens"])
         resets = sum(1 for row in self._usage_history if row["action"] == "context_reset")
+        recent = self._usage_history[-last_n:]
+        raw_values = [float(row["raw_tokens"]) for row in recent]
+        sent_values = [float(row["sent_tokens"]) for row in recent]
+        marker_row = []
+        for row in recent:
+            marker = "".join(row["events"])
+            if "R" in marker:
+                marker_row.append("R")
+            elif "A" in marker:
+                marker_row.append("A")
+            elif row["action"] == "managed":
+                marker_row.append("M")
+            elif row["action"] == "managed_reset_suppressed":
+                marker_row.append("S")
+            else:
+                marker_row.append("P")
 
         lines = [
             "active-memory usage",
@@ -745,11 +778,16 @@ class ContextManager:
             f"Activation at: {self._activation_turn if self._activation_turn is not None else '-'}",
             f"Reset count:   {resets}",
             "",
+            "Trend:",
+            f"  raw  {self._sparkline(raw_values)}",
+            f"  sent {self._sparkline(sent_values)}",
+            f"  evt  {''.join(marker_row)}",
+            "",
             "Legend: P passthrough  A activation  M managed  R reset  S reset-suppressed",
             "Recent turns:",
         ]
 
-        for row in self._usage_history[-last_n:]:
+        for row in recent:
             ratio = row["sent_tokens"] / max(1, budget)
             bar = self._usage_bar(ratio)
             marker = "".join(row["events"]) or {
@@ -758,10 +796,11 @@ class ContextManager:
                 "managed_reset_suppressed": "S",
                 "passthrough": "P",
             }.get(row["action"], "?")
+            savings = max(0, row["raw_tokens"] - row["sent_tokens"])
             lines.append(
                 f"  t{row['turn']:>3} {bar} "
                 f"{row['sent_tokens']:>7,}/{budget:,} ({ratio:>5.1%})  "
-                f"raw={row['raw_tokens']:>7,}  {marker}"
+                f"raw={row['raw_tokens']:>7,}  saved={savings:>7,}  {marker}"
             )
 
         return "\n".join(lines) + "\n"
