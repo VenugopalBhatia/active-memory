@@ -172,61 +172,43 @@ Priority: **defaults < config file < CLI flags**.
 
 ```json
 {
-  "budget": 100000,
-  "model": "claude-sonnet-4-20250514",
-  "embedder": "auto",
-  "embed_model": "text-embedding-3-small",
-  "embed_dim": 64,
-
-  "scoring": {
-    "recency_weight": 0.20,
-    "frequency_weight": 0.20,
-    "relevance_weight": 0.45,
-    "affinity_weight": 0.15,
-    "recency_half_life": 1800.0,
-    "floor": 0.05
-  },
+  "budget": 18000,
 
   "btree": {
     "max_tuples": 16,
-    "min_tuples": 4,
-    "min_children": 2,
-    "compress_threshold": 0.08
+    "compress_threshold": 0.1
   },
 
   "assembler": {
-    "budget_pressure": 0.85,
-    "anchor_relevance_threshold": 0.60,
-    "anchor_budget_fraction": 0.25,
+    "pinned_reserve": 4000,
+    "recency_window": 3,
+    "managed_top_k": 120,
+    "budget_pressure": 0.8,
+    "anchor_relevance_threshold": 0.62,
+    "anchor_budget_fraction": 0.2,
     "dependency_pull": true,
-    "dependency_budget_fraction": 0.10,
-    "managed_top_k": 200,
-    "pinned_reserve": 8000,
-    "recency_window": 4
-  },
-
-  "grounding": {
-    "enabled": true,
-    "provenance_injection": true,
-    "post_verification": true,
-    "auto_correct": false,
-    "grounding_threshold": 0.6,
-    "contradiction_threshold": 0.75,
-    "min_grounding_rate": 0.3
+    "dependency_budget_fraction": 0.08
   },
 
   "proxy": {
     "upstream": "https://api.anthropic.com",
     "verbose": false,
     "state_dir": null,
-    "reset_threshold": 0.75,
-    "reset_briefing_budget": 8000,
-    "reset_recency_turns": 2
-  }
+    "reset_threshold": 0.7,
+    "reset_briefing_budget": 3000,
+    "reset_recency_turns": 2,
+    "reset_cooldown_turns": 8,
+    "reset_hysteresis_ratio": 0.1
+  },
+
+  "prune_interval": 4,
+  "compress_interval": 8
 }
 ```
 
 All fields are optional — omit any you don't need. Top-level `budget` is a convenience alias for `assembler.total_budget`. The `proxy` section is only used by the proxy server.
+
+This example is intentionally tuned for constrained rolling usage limits where you want the proxy to activate early. The built-in code defaults are still more conservative.
 
 ```bash
 # Explicit config file
