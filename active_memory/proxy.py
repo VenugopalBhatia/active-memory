@@ -41,6 +41,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -75,6 +76,8 @@ class ProxyConfig:
         reset_threshold: float = 0.75,  # reset when raw tokens exceed this fraction of budget
         reset_briefing_budget: int = 8_000,  # max tokens for the briefing after reset
         reset_recency_turns: int = 2,  # conversation turns to keep verbatim after reset
+        reset_cooldown_turns: int = 8,  # min turns between resets
+        reset_hysteresis_ratio: float = 0.10,  # required raw growth after a reset
     ):
         self.upstream_url = upstream_url
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -92,6 +95,8 @@ class ProxyConfig:
         self.reset_threshold = reset_threshold
         self.reset_briefing_budget = reset_briefing_budget
         self.reset_recency_turns = reset_recency_turns
+        self.reset_cooldown_turns = reset_cooldown_turns
+        self.reset_hysteresis_ratio = reset_hysteresis_ratio
 
 
 class ContextManager:
@@ -132,6 +137,11 @@ class ContextManager:
         self._message_fingerprints: list[str] = []  # ordered raw-message history for dedupe
         self._state_path = Path(config.state_dir) / "proxy_state.json"
         self._reset_count = 0  # how many times we've done a full context reset
+        self._last_reset_turn = -10_000
+        self._last_reset_raw_tokens = 0
+        self._activation_turn: int | None = None
+        self._usage_history: list[dict[str, Any]] = []
+        self._operational_facts: list[dict[str, Any]] = []
         self._last_debug: dict = {}  # last assembly decision for /debug
 
         # Load previous state if exists
@@ -216,6 +226,60 @@ class ContextManager:
             pending_segments.append((key, buf))
         return pending_segments
 
+    def _extract_operational_facts(self, role: str, content: str) -> list[dict[str, Any]]:
+        """Extract path/file/location hints that should survive resets."""
+        path_pattern = re.compile(r'(?<!\w)(?:~?/|/|\./|\.\./)[^\s,;:()]+')
+        file_pattern = re.compile(
+            r'\b[\w.-]+\.(?:py|js|ts|tsx|jsx|json|md|yaml|yml|toml|html|css|sh|rb|go|java|rs)\b'
+        )
+
+        facts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for pattern in (path_pattern, file_pattern):
+            for match in pattern.finditer(content):
+                text = match.group(0).strip("'\"")
+                if len(text) < 3 or text in seen:
+                    continue
+                seen.add(text)
+                facts.append({
+                    "text": text,
+                    "role": role,
+                    "turn": self._turn_count + 1,
+                })
+        return facts
+
+    def _update_operational_facts(self, messages: list[dict]) -> None:
+        """Track recent explicit file/directory mentions for coding continuity."""
+        for msg in messages:
+            content = self._extract_text(msg)
+            role = msg.get("role", "user")
+            for fact in self._extract_operational_facts(role, content):
+                self._operational_facts = [
+                    existing for existing in self._operational_facts
+                    if existing["text"] != fact["text"]
+                ]
+                self._operational_facts.append(fact)
+        if len(self._operational_facts) > 24:
+            self._operational_facts = self._operational_facts[-24:]
+
+    def _build_operational_context(self) -> str:
+        """Return a compact high-priority block of recent path/file hints."""
+        if not self._operational_facts:
+            return ""
+
+        recent = self._operational_facts[-8:]
+        lines = []
+        for fact in reversed(recent):
+            role = fact["role"]
+            turn = fact["turn"]
+            lines.append(f"- turn {turn} {role}: {fact['text']}")
+        return (
+            "[OPERATIONAL CONTEXT]\n"
+            "Prefer the most recent file/path references when choosing where to edit.\n"
+            "If multiple paths conflict, prefer the newest one rather than older semantically related directories.\n"
+            + "\n".join(lines)
+        )
+
     def process_messages(
         self,
         messages: list[dict],
@@ -244,6 +308,7 @@ class ContextManager:
             pending_segments.extend(self._segment_message(role, content))
 
         self._batch_insert_segments(pending_segments)
+        self._update_operational_facts(messages[prefix_len:])
         self._message_fingerprints = incoming_fingerprints
 
         self._turn_count += 1
@@ -278,6 +343,11 @@ class ContextManager:
                     f"tree: {self.tree.size} tuples (indexing only)",
                     file=sys.stderr,
                 )
+            self._record_usage(
+                action="passthrough",
+                raw_tokens=raw_tokens,
+                sent_tokens=raw_tokens,
+            )
             return messages  # pass through unchanged, but tree is still building
 
         # -- 3. Check if we should do a FULL CONTEXT RESET --
@@ -286,9 +356,38 @@ class ContextManager:
         # From the model's perspective, it's a brand new conversation with
         # a curated briefing. Context rot literally cannot survive this.
         reset_threshold_tokens = int(self.cfg.token_budget * self.cfg.reset_threshold)
+        reset_growth_tokens = int(self.cfg.token_budget * self.cfg.reset_hysteresis_ratio)
+        reset_growth_floor = max(reset_threshold_tokens, self._last_reset_raw_tokens + reset_growth_tokens)
+        reset_cooldown_active = (
+            self._reset_count > 0
+            and (self._turn_count - self._last_reset_turn) <= self.cfg.reset_cooldown_turns
+        )
 
         if raw_tokens > reset_threshold_tokens:
-            return self._context_reset(messages, system)
+            if reset_cooldown_active or raw_tokens < reset_growth_floor:
+                self._last_debug = {
+                    "turn": self._turn_count,
+                    "action": "managed_reset_suppressed",
+                    "original_tokens": raw_tokens,
+                    "reset_threshold": reset_threshold_tokens,
+                    "reset_growth_floor": reset_growth_floor,
+                    "reset_cooldown_turns": self.cfg.reset_cooldown_turns,
+                    "turns_since_reset": self._turn_count - self._last_reset_turn,
+                    "tree_size": self.tree.size,
+                }
+                if self.cfg.verbose:
+                    reason = (
+                        "cooldown"
+                        if reset_cooldown_active
+                        else "insufficient growth"
+                    )
+                    print(
+                        f"  [proxy] turn {self._turn_count}: reset suppressed "
+                        f"({reason}; raw={raw_tokens:,}, floor={reset_growth_floor:,})",
+                        file=sys.stderr,
+                    )
+            else:
+                return self._context_reset(messages, system)
 
         # -- 4. Periodic maintenance --
         if self._turn_count % self.cfg.prune_interval == 0:
@@ -317,6 +416,12 @@ class ContextManager:
             system if isinstance(system, str) else "",
             assembled,
         )
+        operational_context = self._build_operational_context()
+        if operational_context:
+            optimised.insert(0, {
+                "role": "user",
+                "content": operational_context,
+            })
 
         # -- 5. Capture debug info --
         original_tokens = sum(
@@ -375,6 +480,11 @@ class ContextManager:
                     file=sys.stderr,
                 )
 
+        self._record_usage(
+            action=self._last_debug["action"],
+            raw_tokens=original_tokens,
+            sent_tokens=assembled.total_tokens,
+        )
         return optimised
 
     def _context_reset(
@@ -407,6 +517,7 @@ class ContextManager:
         The B-tree survives every reset. It has been indexing from turn 1.
         """
         self._reset_count += 1
+        self._last_reset_turn = self._turn_count
 
         # -- 1. Aggressive maintenance before reset --
         self.tree.prune()
@@ -476,6 +587,12 @@ class ContextManager:
 
         # -- 3. Construct fresh message list --
         fresh_messages: list[dict] = []
+        operational_context = self._build_operational_context()
+        if operational_context:
+            fresh_messages.append({
+                "role": "user",
+                "content": operational_context,
+            })
 
         if briefing_sections:
             briefing_text = "\n\n".join(briefing_sections)
@@ -507,6 +624,7 @@ class ContextManager:
         original_tokens = sum(
             len(self._extract_text(m)) // 4 for m in messages
         )
+        self._last_reset_raw_tokens = original_tokens
         reset_tokens = sum(
             len(self._extract_text(m)) // 4 for m in fresh_messages
         )
@@ -537,6 +655,11 @@ class ContextManager:
                 file=sys.stderr,
             )
 
+        self._record_usage(
+            action="context_reset",
+            raw_tokens=original_tokens,
+            sent_tokens=reset_tokens,
+        )
         self._save_state()
         return fresh_messages
 
@@ -563,6 +686,85 @@ class ContextManager:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _usage_bar(value: float, width: int = 24) -> str:
+        value = max(0.0, min(1.0, value))
+        filled = int(round(value * width))
+        return "█" * filled + "░" * (width - filled)
+
+    def _record_usage(self, *, action: str, raw_tokens: int, sent_tokens: int) -> None:
+        """Persist per-turn usage for the /usage endpoint."""
+        events: list[str] = []
+        if self._activation_turn is None and action != "passthrough":
+            self._activation_turn = self._turn_count
+            events.append("A")
+        if action == "context_reset":
+            events.append("R")
+        elif action == "managed_reset_suppressed":
+            events.append("S")
+        elif action == "passthrough":
+            events.append("P")
+
+        self._usage_history.append({
+            "turn": self._turn_count,
+            "timestamp": time.time(),
+            "action": action,
+            "raw_tokens": raw_tokens,
+            "sent_tokens": sent_tokens,
+            "events": events,
+        })
+        if len(self._usage_history) > 240:
+            self._usage_history = self._usage_history[-240:]
+
+    def render_usage_report(self, last_n: int = 30) -> str:
+        """Render a terminal-friendly usage graph for recent turns."""
+        budget = self.cfg.token_budget
+        activation_threshold = budget // 2
+        reset_threshold = int(budget * self.cfg.reset_threshold)
+
+        if not self._usage_history:
+            return "active-memory usage\nNo usage samples recorded yet.\n"
+
+        latest = self._usage_history[-1]
+        raw_ratio = latest["raw_tokens"] / max(1, budget)
+        sent_ratio = latest["sent_tokens"] / max(1, budget)
+        raw_left = max(0, budget - latest["raw_tokens"])
+        sent_left = max(0, budget - latest["sent_tokens"])
+        resets = sum(1 for row in self._usage_history if row["action"] == "context_reset")
+
+        lines = [
+            "active-memory usage",
+            f"Budget:        {budget:>8,} tok",
+            f"Activation:    {activation_threshold:>8,} tok",
+            f"Reset:         {reset_threshold:>8,} tok",
+            "",
+            f"Raw history:   {latest['raw_tokens']:>8,} tok  {raw_ratio:>6.1%} used  {raw_left:>8,} left",
+            f"Proxy sent:    {latest['sent_tokens']:>8,} tok  {sent_ratio:>6.1%} used  {sent_left:>8,} left",
+            f"Current mode:  {latest['action']}",
+            f"Activation at: {self._activation_turn if self._activation_turn is not None else '-'}",
+            f"Reset count:   {resets}",
+            "",
+            "Legend: P passthrough  A activation  M managed  R reset  S reset-suppressed",
+            "Recent turns:",
+        ]
+
+        for row in self._usage_history[-last_n:]:
+            ratio = row["sent_tokens"] / max(1, budget)
+            bar = self._usage_bar(ratio)
+            marker = "".join(row["events"]) or {
+                "managed": "M",
+                "context_reset": "R",
+                "managed_reset_suppressed": "S",
+                "passthrough": "P",
+            }.get(row["action"], "?")
+            lines.append(
+                f"  t{row['turn']:>3} {bar} "
+                f"{row['sent_tokens']:>7,}/{budget:,} ({ratio:>5.1%})  "
+                f"raw={row['raw_tokens']:>7,}  {marker}"
+            )
+
+        return "\n".join(lines) + "\n"
 
     def ingest_assistant_response(self, response_data: dict[str, Any]) -> None:
         """Index a completed non-streaming assistant response immediately."""
@@ -591,6 +793,12 @@ class ContextManager:
         tuples = self.tree.all_tuples()
         state = {
             "turn_count": self._turn_count,
+            "reset_count": self._reset_count,
+            "last_reset_turn": self._last_reset_turn,
+            "last_reset_raw_tokens": self._last_reset_raw_tokens,
+            "activation_turn": self._activation_turn,
+            "usage_history": self._usage_history,
+            "operational_facts": self._operational_facts,
             "message_fingerprints": self._message_fingerprints,
             "embedding": self._embedding_state(),
             "tuples": [
@@ -621,6 +829,12 @@ class ContextManager:
 
             state = json.loads(self._state_path.read_text())
             self._turn_count = state.get("turn_count", 0)
+            self._reset_count = state.get("reset_count", 0)
+            self._last_reset_turn = state.get("last_reset_turn", -10_000)
+            self._last_reset_raw_tokens = state.get("last_reset_raw_tokens", 0)
+            self._activation_turn = state.get("activation_turn")
+            self._usage_history = list(state.get("usage_history", []))
+            self._operational_facts = list(state.get("operational_facts", []))
             self._message_fingerprints = list(state.get("message_fingerprints", []))
             reembed = self._state_requires_reembed(state)
             if reembed and self.cfg.verbose:
@@ -679,6 +893,8 @@ def _serialize_config(cm: ContextManager) -> dict:
         "reset_threshold": cm.cfg.reset_threshold,
         "reset_briefing_budget": cm.cfg.reset_briefing_budget,
         "reset_recency_turns": cm.cfg.reset_recency_turns,
+        "reset_cooldown_turns": cm.cfg.reset_cooldown_turns,
+        "reset_hysteresis_ratio": cm.cfg.reset_hysteresis_ratio,
         "embedder": cm.embedder_spec.description,
         "scoring": {
             "recency_weight": cm.scorer.cfg.recency_weight,
@@ -744,6 +960,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             })
         elif route == "/config":
             self._respond_json(200, _serialize_config(self.context_manager))
+        elif route == "/usage":
+            self._respond_text(200, self.context_manager.render_usage_report())
         else:
             self.send_error(404)
 
@@ -801,6 +1019,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             old = cm.cfg.reset_briefing_budget
             cm.cfg.reset_briefing_budget = int(updates["reset_briefing_budget"])
             changed["reset_briefing_budget"] = {"old": old, "new": cm.cfg.reset_briefing_budget}
+
+        if "reset_recency_turns" in updates:
+            old = cm.cfg.reset_recency_turns
+            cm.cfg.reset_recency_turns = int(updates["reset_recency_turns"])
+            changed["reset_recency_turns"] = {"old": old, "new": cm.cfg.reset_recency_turns}
+
+        if "reset_cooldown_turns" in updates:
+            old = cm.cfg.reset_cooldown_turns
+            cm.cfg.reset_cooldown_turns = int(updates["reset_cooldown_turns"])
+            changed["reset_cooldown_turns"] = {"old": old, "new": cm.cfg.reset_cooldown_turns}
+
+        if "reset_hysteresis_ratio" in updates:
+            old = cm.cfg.reset_hysteresis_ratio
+            cm.cfg.reset_hysteresis_ratio = float(updates["reset_hysteresis_ratio"])
+            changed["reset_hysteresis_ratio"] = {"old": old, "new": cm.cfg.reset_hysteresis_ratio}
 
         # -- Scoring weights --
         if "scoring" in updates and isinstance(updates["scoring"], dict):
@@ -1020,6 +1253,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, indent=2).encode())
 
+    def _respond_text(self, status: int, text: str):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(text.encode("utf-8"))
+
     def log_message(self, format, *args):
         """Suppress default access logs unless verbose."""
         if self.proxy_config.verbose:
@@ -1089,6 +1328,18 @@ Example:
         help="Conversation turns to keep verbatim after reset",
     )
     parser.add_argument(
+        "--reset-cooldown-turns",
+        type=int,
+        default=8,
+        help="Minimum turns between consecutive context resets",
+    )
+    parser.add_argument(
+        "--reset-hysteresis-ratio",
+        type=float,
+        default=0.10,
+        help="Required additional raw token growth after a reset before resetting again",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help="Path to a JSON config file (overrides defaults, CLI flags override config)",
@@ -1132,6 +1383,8 @@ Example:
         reset_threshold=_resolve(args.reset_threshold, 0.75, "reset_threshold", float),
         reset_briefing_budget=_resolve(args.reset_briefing_budget, 8_000, "reset_briefing_budget", int),
         reset_recency_turns=_resolve(args.reset_recency_turns, 2, "reset_recency_turns", int),
+        reset_cooldown_turns=_resolve(args.reset_cooldown_turns, 8, "reset_cooldown_turns", int),
+        reset_hysteresis_ratio=_resolve(args.reset_hysteresis_ratio, 0.10, "reset_hysteresis_ratio", float),
     )
 
     if not config.api_key:
@@ -1179,6 +1432,7 @@ Example:
   Endpoints:
     /health     Health check + tree stats
     /stats      Detailed metrics
+    /usage      Terminal-friendly usage graph
     /debug      Last assembly decision (selected tuples, scores)
     /config     GET current config / POST to hot-reload parameters
 
