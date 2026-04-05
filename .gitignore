@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+dist-repo/
+*.egg-info/
+*.pyc
+*.pyo
+.DS_Store
+.active-memory/
+active_memory_export_*.json
+.claude/
+.env
+PUBLISHING_CHECKLIST.md

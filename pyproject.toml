@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "active-memory"
+version = "0.1.0a0"
+description = "Active memory management for long LLM context windows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Venugopal Bhatia" }
+]
+keywords = ["llm", "context-window", "memory", "proxy", "claude", "anthropic"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+anthropic = [
+  "anthropic>=0.34.0",
+]
+openai = [
+  "openai>=1.30.0",
+]
+dev = [
+  "anthropic>=0.34.0",
+  "pytest>=8.0",
+]
+
+[project.scripts]
+active-memory = "active_memory.proxy:main"
+active-memory-chat = "active_memory.cli:main"
+active-memory-eval = "active_memory.eval:main"
+active-memory-live-bench = "active_memory.live_ab_bench:main"
+active-memory-long-context-bench = "active_memory.long_context_bench:main"
+active-memory-proxy-live-bench = "active_memory.proxy_live_bench:main"
+active-memory-mcp = "active_memory.mcp_server:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["active_memory"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
