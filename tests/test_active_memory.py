@@ -305,6 +305,44 @@ class TestAssemblerBehavior(unittest.TestCase):
         self.assertEqual(messages[-1]["content"], "Remind me of the decision.")
         self.assertTrue(any("<retrieved_context>" in msg.get("content", "") for msg in messages))
 
+    def test_recency_window_zero_disables_pinning(self) -> None:
+        tree, embedder, _ = make_tree()
+        tree.insert("database policy", "Use PostgreSQL.")
+        assembler = ContextAssembler(
+            tree=tree,
+            config=AssemblerConfig(total_budget=400, pinned_reserve=50, recency_window=0),
+        )
+        conversation = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]
+
+        assembled = assembler.assemble(conversation, embedder.embed(["database"])[0])
+
+        self.assertEqual(assembled.pinned_messages, [])
+
+    def test_to_messages_accounts_for_wrapper_tokens(self) -> None:
+        tree, embedder, _ = make_tree()
+        for i in range(8):
+            tree.insert(f"database fact {i}", f"Database detail {i} about postgres config.")
+
+        assembler = ContextAssembler(
+            tree=tree,
+            config=AssemblerConfig(total_budget=2000, pinned_reserve=100, recency_window=1),
+        )
+        conversation = [
+            {"role": "user", "content": "Earlier discussion."},
+            {"role": "assistant", "content": "Yes we discussed."},
+            {"role": "user", "content": "Remind me of the database decision."},
+        ]
+        assembled = assembler.assemble(conversation, embedder.embed(["database"])[0])
+        tokens_before = assembled.total_tokens
+
+        assembler.to_messages(None, assembled)
+
+        self.assertGreater(assembled.wrapper_tokens, 0)
+        self.assertGreater(assembled.total_tokens, tokens_before)
+
 
 class TestContextManagerAndProxyBehavior(unittest.TestCase):
     def test_context_manager_passthroughs_small_conversation_but_indexes_it(self) -> None:
@@ -498,6 +536,32 @@ class TestAssemblerAndGroundingBehavior(unittest.TestCase):
         assembled = assembler.assemble(conversation, embedder.embed(["topic"])[0])
 
         self.assertGreaterEqual(assembled.total_tokens, 50)
+
+    def test_assembler_counts_tool_blocks_in_pinned_messages(self) -> None:
+        tree, embedder, _ = make_tree()
+        assembler = ContextAssembler(
+            tree=tree,
+            config=AssemblerConfig(total_budget=2000, pinned_reserve=100, recency_window=1),
+        )
+        conversation = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me check."},
+                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls -la"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "total 42\ndrwxr-xr-x 5 user"},
+                ],
+            },
+        ]
+
+        assembled = assembler.assemble(conversation, embedder.embed(["topic"])[0])
+
+        self.assertGreater(assembled.total_tokens, 10)
 
     def test_grounded_assembler_uses_configured_thresholds(self) -> None:
         tree = SemanticBTree(

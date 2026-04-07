@@ -70,6 +70,7 @@ class AssembledContext:
     tuples_included: int
     anchored_count: int = 0           # tuples force-included by anchoring
     dependency_count: int = 0         # tuples pulled in by call graph
+    wrapper_tokens: int = 0           # tokens added by synthetic wrapper messages
 
 
 class ContextAssembler:
@@ -102,7 +103,10 @@ class ContextAssembler:
         AssembledContext with pinned messages + managed blocks.
         """
         # -- 1. Pin recent turns --
-        pinned = conversation[-self.cfg.recency_window * 2 :]
+        if self.cfg.recency_window > 0:
+            pinned = conversation[-self.cfg.recency_window * 2 :]
+        else:
+            pinned = []
         pinned_tokens = sum(
             estimate_tokens(self._message_text(m)) for m in pinned
         )
@@ -154,7 +158,6 @@ class ContextAssembler:
                         t.touch()
 
         # -- 5. Greedy knapsack: fill budget by score --
-        scored_budget = managed_budget - sum(b.token_cost for b in anchored_blocks)
         blocks: list[ManagedBlock] = list(anchored_blocks)
         scored_ids: set[str] = set(anchored_ids)
         used = sum(b.token_cost for b in blocks)
@@ -187,7 +190,11 @@ class ContextAssembler:
 
             for t in self.tree.all_tuples():
                 if t.id in dep_ids and t.id not in scored_ids:
-                    if t.token_cost <= dep_budget and t.key_text not in included_keys:
+                    if (
+                        t.token_cost <= dep_budget
+                        and used + t.token_cost <= managed_budget
+                        and t.key_text not in included_keys
+                    ):
                         blocks.append(ManagedBlock(
                             key=t.key_text,
                             value=t.value_text,
@@ -228,10 +235,15 @@ class ContextAssembler:
 
     def to_messages(
         self,
-        system_prompt: str,
+        system_prompt: str | list | None,
         assembled: AssembledContext,
     ) -> list[dict]:
         """Convert an AssembledContext into Anthropic-style messages.
+
+        Note: *system_prompt* is accepted for token accounting but is NOT
+        injected into the returned message list because the Anthropic API
+        takes ``system`` as a separate top-level field.  The caller is
+        responsible for forwarding it in ``request_data["system"]``.
 
         Uses position-aware layout to fight attention degradation:
 
@@ -252,6 +264,7 @@ class ContextAssembler:
         end of the sequence, even if they were originally from turn 2.
         """
         messages: list[dict] = []
+        wrapper_tokens = 0
 
         if assembled.managed_blocks:
             # Partition blocks by source for positional placement
@@ -297,10 +310,14 @@ class ContextAssembler:
                     + context_block
                 ),
             })
+            ack_text = "Understood. I have the retrieved context available."
             messages.append({
                 "role": "assistant",
-                "content": "Understood. I have the retrieved context available.",
+                "content": ack_text,
             })
+            wrapper_tokens += estimate_tokens(
+                messages[-2]["content"]
+            ) + estimate_tokens(ack_text)
 
         # ── Position 4: Pinned recent turns ──
         # These go after managed context but before the recap.
@@ -340,14 +357,18 @@ class ContextAssembler:
                     pass  # Don't modify existing messages
                 else:
                     # Add as a new exchange
+                    recap_ack = "Noted, I have these key points in mind."
                     messages.append({
                         "role": "user",
                         "content": recap_text,
                     })
                     messages.append({
                         "role": "assistant",
-                        "content": "Noted, I have these key points in mind.",
+                        "content": recap_ack,
                     })
+                    wrapper_tokens += estimate_tokens(
+                        recap_text
+                    ) + estimate_tokens(recap_ack)
 
             # ── Position 6: The actual user message (VERY END = maximum attention) ──
             messages.append(last_msg)
@@ -355,11 +376,20 @@ class ContextAssembler:
             # No pinned messages — just the managed context
             pass
 
+        # Record wrapper overhead so callers can compute accurate totals
+        assembled.wrapper_tokens = wrapper_tokens
+        assembled.total_tokens += wrapper_tokens
+        assembled.budget_remaining -= wrapper_tokens
+
         return messages
 
     @staticmethod
     def _message_text(message: dict[str, Any]) -> str:
-        """Normalize Anthropic-style message content into plain text."""
+        """Normalize Anthropic-style message content into plain text.
+
+        Handles text, tool_use, and tool_result blocks so that token
+        estimates cover the full content, not just text blocks.
+        """
         content = message.get("content", "")
         if isinstance(content, str):
             return content
@@ -368,7 +398,23 @@ class ContextAssembler:
             for item in content:
                 if isinstance(item, str):
                     parts.append(item)
-                elif isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
+                elif isinstance(item, dict):
+                    item_type = item.get("type", "")
+                    if item_type == "text":
+                        parts.append(str(item.get("text", "")))
+                    elif item_type == "tool_use":
+                        name = item.get("name", "")
+                        inp = item.get("input", {})
+                        parts.append(f"[tool_use:{name}] {inp}")
+                    elif item_type == "tool_result":
+                        rc = item.get("content", "")
+                        if isinstance(rc, str):
+                            parts.append(rc)
+                        elif isinstance(rc, list):
+                            for sub in rc:
+                                if isinstance(sub, str):
+                                    parts.append(sub)
+                                elif isinstance(sub, dict) and sub.get("type") == "text":
+                                    parts.append(str(sub.get("text", "")))
             return "\n".join(part for part in parts if part)
         return str(content)
