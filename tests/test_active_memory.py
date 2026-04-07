@@ -602,6 +602,100 @@ class TestContextManagerAndProxyBehavior(unittest.TestCase):
             manager.process_messages(next_turn)
             self.assertEqual(manager.tree.size, tree_after_stream + 1)
 
+    def test_assembled_prompt_never_exceeds_total_budget_with_wrappers(self) -> None:
+        """Regression: previously, ``assemble`` sized the managed budget
+        without reserving room for the SYSTEM hint / ack / recap wrapper
+        messages added by ``to_messages``. With a tight budget, the
+        final prompt could exceed ``total_budget``. Now wrapper overhead
+        and per-block formatting are reserved up front."""
+        tree = SemanticBTree(
+            embedder=HashEmbedder(dim=8),
+            scorer=Scorer(),
+            config=BTreeConfig(max_tuples=4),
+        )
+        for i in range(20):
+            tree.insert(
+                f"topic {i}",
+                f"fact about topic {i} that is somewhat detailed " * 4,
+            )
+
+        budget = 1_000
+        assembler = ContextAssembler(
+            tree,
+            AssemblerConfig(
+                total_budget=budget,
+                pinned_reserve=100,
+                recency_window=2,
+                budget_pressure=1.0,
+            ),
+        )
+        conversation = [
+            {"role": "user", "content": "tell me about topic 3"},
+            {"role": "assistant", "content": "sure"},
+            {"role": "user", "content": "and topic 5?"},
+        ]
+        query_emb = HashEmbedder(dim=8).embed(["and topic 5?"])[0]
+        system_prompt = "You are a helpful assistant " * 10
+
+        assembled = assembler.assemble(
+            conversation, query_emb, system=system_prompt
+        )
+        messages = assembler.to_messages(system_prompt, assembled)
+
+        actual_total = (
+            estimate_tokens(system_prompt)
+            + sum(estimate_tokens(m["content"]) for m in messages)
+        )
+        # Authoritative accounting matches the actual sum.
+        self.assertEqual(assembled.total_tokens, actual_total)
+        # And the actual sum fits within the configured budget.
+        self.assertLessEqual(actual_total, budget)
+        # System tokens are now tracked.
+        self.assertEqual(assembled.system_tokens, estimate_tokens(system_prompt))
+        # We still selected something useful.
+        self.assertGreater(assembled.tuples_included, 0)
+
+    def test_proxy_activation_includes_system_prompt_tokens(self) -> None:
+        """Regression: previously the proxy's raw_tokens calculation
+        ignored the system prompt, so a tiny message list with a huge
+        system prompt would stay in passthrough even though the actual
+        upstream request blew past the budget."""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ContextManager(
+                ProxyConfig(
+                    token_budget=1_000,
+                    embedder_provider="hash",
+                    state_dir=tmp,
+                )
+            )
+            # Pre-populate the tree so managed assembly has something
+            # to work with when activation triggers.
+            for i in range(10):
+                manager.tree.insert(f"seed {i}", f"seed fact {i} " * 6)
+
+            # 180-token user message but a huge system prompt.
+            messages = [{"role": "user", "content": "short question " * 30}]
+            big_system = "You are a meticulous assistant. " * 60
+
+            raw_msg_tokens = sum(
+                estimate_tokens(m["content"]) for m in messages
+            )
+            sys_tokens = estimate_tokens(big_system)
+            self.assertLess(raw_msg_tokens, 1_000 // 2)  # would be passthrough
+            self.assertGreater(raw_msg_tokens + sys_tokens, 1_000 // 2)
+
+            manager.process_messages(messages, system=big_system)
+
+            # The proxy should NOT have stayed in passthrough — system
+            # tokens pushed it over the activation threshold.
+            self.assertNotEqual(manager._last_debug.get("action"), "passthrough")
+            # And the recorded original_tokens should reflect the system
+            # prompt rather than just the message list.
+            self.assertGreaterEqual(
+                manager._last_debug.get("original_tokens", 0),
+                raw_msg_tokens + sys_tokens,
+            )
+
     def test_to_messages_is_idempotent_for_wrapper_token_accounting(self) -> None:
         """Regression: calling ContextAssembler.to_messages twice on the
         same AssembledContext must not double-count wrapper tokens."""

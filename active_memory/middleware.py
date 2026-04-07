@@ -133,10 +133,10 @@ class ActiveMemoryMiddleware:
         else:
             # Standard assembler
             system_prompt = self.cfg.system_prompt
-            assembled = self.assembler.assemble(self._conversation, query_emb)
-            messages = self.assembler.to_messages(
-                self.cfg.system_prompt, assembled
+            assembled = self.assembler.assemble(
+                self._conversation, query_emb, system=system_prompt
             )
+            messages = self.assembler.to_messages(system_prompt, assembled)
             assembled_tokens = assembled.total_tokens
             tuples_considered = assembled.tuples_considered
             tuples_included = assembled.tuples_included

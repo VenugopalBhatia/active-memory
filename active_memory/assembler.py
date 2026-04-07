@@ -23,6 +23,18 @@ from .btree import SemanticBTree
 from .types import Embedding, KVTuple, cosine_sim, estimate_tokens
 
 
+# Wrapper overhead estimates used to reserve budget *before* knapsacking.
+# These cover text that ``to_messages`` adds beyond the raw block content:
+#   - the SYSTEM hint preface + ack message exchange
+#   - the optional "key context reminder" recap exchange
+#   - per-block formatting (``[key]\n value`` lines)
+# Reserving up front prevents the assembled prompt from exceeding
+# total_budget after wrappers are added.
+_WRAPPER_FIXED_OVERHEAD = 80      # SYSTEM hint + ack + section headers
+_WRAPPER_RECAP_OVERHEAD = 60      # recap user/assistant exchange
+_WRAPPER_PER_BLOCK_OVERHEAD = 8   # formatting tokens per included block
+
+
 @dataclass
 class AssemblerConfig:
     total_budget: int = 18_000        # max tokens for the full prompt
@@ -71,6 +83,7 @@ class AssembledContext:
     anchored_count: int = 0           # tuples force-included by anchoring
     dependency_count: int = 0         # tuples pulled in by call graph
     wrapper_tokens: int = 0           # tokens added by synthetic wrapper messages
+    system_tokens: int = 0            # tokens consumed by the system prompt
 
 
 class ContextAssembler:
@@ -88,6 +101,7 @@ class ContextAssembler:
         self,
         conversation: list[dict],
         query_emb: Embedding | None = None,
+        system: Any = None,
     ) -> AssembledContext:
         """Build a context-managed prompt.
 
@@ -97,6 +111,12 @@ class ContextAssembler:
             Full conversation history (role/content dicts).
         query_emb : Embedding, optional
             Embedding of the current user query for relevance scoring.
+        system : str | list | None, optional
+            The system prompt that will be forwarded to the model.
+            Anthropic accepts ``system`` as a top-level field rather
+            than a message, but its tokens still count toward the
+            context window — so we deduct them from the available
+            budget here to avoid overflowing the upstream request.
 
         Returns
         -------
@@ -111,9 +131,21 @@ class ContextAssembler:
             estimate_tokens(self._message_text(m)) for m in pinned
         )
 
+        # System prompt tokens are forwarded as a top-level field but
+        # still consume context-window budget.
+        system_tokens = estimate_tokens(self._system_text(system))
+
         # -- 2. Compute remaining budget for managed context --
+        # Reserve wrapper overhead (SYSTEM hint, ack, recap) up front
+        # so the final assembled prompt cannot exceed total_budget once
+        # to_messages() finishes adding wrapper text.
         managed_budget = (
-            self.cfg.total_budget - self.cfg.pinned_reserve - pinned_tokens
+            self.cfg.total_budget
+            - self.cfg.pinned_reserve
+            - pinned_tokens
+            - system_tokens
+            - _WRAPPER_FIXED_OVERHEAD
+            - _WRAPPER_RECAP_OVERHEAD
         )
         managed_budget = max(0, managed_budget)
 
@@ -144,7 +176,8 @@ class ContextAssembler:
                     continue
                 rel = cosine_sim(query_emb, t.key_emb)
                 if rel >= self.cfg.anchor_relevance_threshold:
-                    if t.token_cost <= anchor_budget and t.key_text not in included_keys:
+                    effective_cost = t.token_cost + _WRAPPER_PER_BLOCK_OVERHEAD
+                    if effective_cost <= anchor_budget and t.key_text not in included_keys:
                         anchored_blocks.append(ManagedBlock(
                             key=t.key_text,
                             value=t.value_text,
@@ -152,20 +185,24 @@ class ContextAssembler:
                             token_cost=t.token_cost,
                             source="anchored",
                         ))
-                        anchor_budget -= t.token_cost
+                        anchor_budget -= effective_cost
                         anchored_ids.add(t.id)
                         included_keys.add(t.key_text)
                         t.touch()
 
         # -- 5. Greedy knapsack: fill budget by score --
+        # Each block carries a small per-block formatting overhead
+        # (the ``[key]\n value`` lines wrap around its raw content).
+        # Charge it to the budget so the final wrapped prompt fits.
         blocks: list[ManagedBlock] = list(anchored_blocks)
         scored_ids: set[str] = set(anchored_ids)
-        used = sum(b.token_cost for b in blocks)
+        used = sum(b.token_cost + _WRAPPER_PER_BLOCK_OVERHEAD for b in blocks)
 
         for score, t in scored:
             if t.id in scored_ids:
                 continue
-            if used + t.token_cost > managed_budget:
+            effective_cost = t.token_cost + _WRAPPER_PER_BLOCK_OVERHEAD
+            if used + effective_cost > managed_budget:
                 continue
             blocks.append(
                 ManagedBlock(
@@ -178,7 +215,7 @@ class ContextAssembler:
             )
             scored_ids.add(t.id)
             included_keys.add(t.key_text)
-            used += t.token_cost
+            used += effective_cost
 
         # -- 6. Dependency pull --
         # If included tuples have structural references (call graph),
@@ -190,9 +227,10 @@ class ContextAssembler:
 
             for t in self.tree.all_tuples():
                 if t.id in dep_ids and t.id not in scored_ids:
+                    effective_cost = t.token_cost + _WRAPPER_PER_BLOCK_OVERHEAD
                     if (
-                        t.token_cost <= dep_budget
-                        and used + t.token_cost <= managed_budget
+                        effective_cost <= dep_budget
+                        and used + effective_cost <= managed_budget
                         and t.key_text not in included_keys
                     ):
                         blocks.append(ManagedBlock(
@@ -202,8 +240,8 @@ class ContextAssembler:
                             token_cost=t.token_cost,
                             source="dependency",
                         ))
-                        dep_budget -= t.token_cost
-                        used += t.token_cost
+                        dep_budget -= effective_cost
+                        used += effective_cost
                         scored_ids.add(t.id)
                         included_keys.add(t.key_text)
                         dep_count += 1
@@ -212,15 +250,20 @@ class ContextAssembler:
         # -- 7. Update scorer's active context for affinity computation --
         self.tree.scorer.set_active_context(scored_ids)
 
+        # ``total_tokens`` here is provisional; ``to_messages`` will
+        # overwrite it with an authoritative count once the actual
+        # message list is built.
+        raw_block_tokens = sum(b.token_cost for b in blocks)
         return AssembledContext(
             pinned_messages=pinned,
             managed_blocks=blocks,
-            total_tokens=pinned_tokens + used,
+            total_tokens=pinned_tokens + system_tokens + raw_block_tokens,
             budget_remaining=managed_budget - used,
             tuples_considered=len(scored),
             tuples_included=len(blocks),
             anchored_count=len(anchored_blocks),
             dependency_count=dep_count,
+            system_tokens=system_tokens,
         )
 
     def _collect_dependency_ids(self, included_ids: set[str]) -> set[str]:
@@ -268,14 +311,7 @@ class ContextAssembler:
         Callers may modify ``assembled.managed_blocks`` between calls
         (e.g. to drop blocks for budget pressure) and re-invoke safely.
         """
-        # Reset prior wrapper accounting so this method is idempotent.
-        if assembled.wrapper_tokens:
-            assembled.total_tokens -= assembled.wrapper_tokens
-            assembled.budget_remaining += assembled.wrapper_tokens
-            assembled.wrapper_tokens = 0
-
         messages: list[dict] = []
-        wrapper_tokens = 0
 
         if assembled.managed_blocks:
             # Partition blocks by source for positional placement
@@ -326,9 +362,6 @@ class ContextAssembler:
                 "role": "assistant",
                 "content": ack_text,
             })
-            wrapper_tokens += estimate_tokens(
-                messages[-2]["content"]
-            ) + estimate_tokens(ack_text)
 
         # ── Position 4: Pinned recent turns ──
         # These go after managed context but before the recap.
@@ -377,9 +410,6 @@ class ContextAssembler:
                         "role": "assistant",
                         "content": recap_ack,
                     })
-                    wrapper_tokens += estimate_tokens(
-                        recap_text
-                    ) + estimate_tokens(recap_ack)
 
             # ── Position 6: The actual user message (VERY END = maximum attention) ──
             messages.append(last_msg)
@@ -387,12 +417,52 @@ class ContextAssembler:
             # No pinned messages — just the managed context
             pass
 
-        # Record wrapper overhead so callers can compute accurate totals
-        assembled.wrapper_tokens = wrapper_tokens
-        assembled.total_tokens += wrapper_tokens
-        assembled.budget_remaining -= wrapper_tokens
+        # -- Authoritative token accounting --
+        # Compute total_tokens from the actual built message list plus
+        # the system prompt (which is forwarded as a top-level field
+        # but still counts toward the model's context window). This
+        # avoids drift between estimates and what is actually sent.
+        system_tokens = estimate_tokens(self._system_text(system_prompt))
+        message_tokens = sum(
+            estimate_tokens(self._message_text(m)) for m in messages
+        )
+        raw_block_tokens = sum(b.token_cost for b in assembled.managed_blocks)
+        pinned_tokens = sum(
+            estimate_tokens(self._message_text(m))
+            for m in assembled.pinned_messages
+        )
+        # Wrapper overhead = everything in the message list that is not
+        # pinned content and not raw block content.
+        assembled.system_tokens = system_tokens
+        assembled.wrapper_tokens = max(
+            0, message_tokens - pinned_tokens - raw_block_tokens
+        )
+        assembled.total_tokens = message_tokens + system_tokens
+        assembled.budget_remaining = self.cfg.total_budget - assembled.total_tokens
 
         return messages
+
+    @staticmethod
+    def _system_text(system: Any) -> str:
+        """Normalize an Anthropic ``system`` payload into plain text.
+
+        ``system`` may be ``None``, a plain string, or a list of text
+        blocks (``[{"type": "text", "text": "..."}]``).
+        """
+        if system is None:
+            return ""
+        if isinstance(system, str):
+            return system
+        if isinstance(system, list):
+            parts: list[str] = []
+            for block in system:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(str(block.get("text", "")))
+            return "\n".join(parts)
+        return str(system)
 
     @staticmethod
     def _message_text(message: dict[str, Any]) -> str:

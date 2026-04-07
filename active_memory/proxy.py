@@ -340,7 +340,12 @@ class ContextManager:
         # -- 2. Bypass if conversation is small --
         # No point managing context if it already fits comfortably.
         # Only activate when raw conversation exceeds 50% of budget.
-        raw_tokens = sum(
+        # The system prompt is forwarded as a top-level field but still
+        # consumes context-window budget upstream, so include it here
+        # too — otherwise a large system prompt can push the request
+        # over budget while the proxy stays in passthrough mode.
+        system_tokens = estimate_tokens(self._system_text(system))
+        raw_tokens = system_tokens + sum(
             estimate_tokens(self._extract_text(m)) for m in messages
         )
         activation_threshold = self.cfg.token_budget // 2
@@ -425,7 +430,7 @@ class ContextManager:
 
         if last_user_msg and self.tree.size > 0:
             query_emb = self.embedder.embed([last_user_msg])[0]
-            assembled = self.assembler.assemble(messages, query_emb)
+            assembled = self.assembler.assemble(messages, query_emb, system=system)
         else:
             # Not enough context to manage — pass through
             self._last_debug = {
@@ -487,7 +492,7 @@ class ContextManager:
                 assembled.budget_remaining -= operational_tokens
 
         # -- 5. Capture debug info --
-        original_tokens = sum(
+        original_tokens = system_tokens + sum(
             estimate_tokens(self._extract_text(m)) for m in messages
         )
         selected = [
@@ -685,11 +690,12 @@ class ContextManager:
         fresh_messages.extend(recent_turns)
 
         # -- 5. Capture debug info and log the reset --
-        original_tokens = sum(
+        system_tokens = estimate_tokens(self._system_text(system))
+        original_tokens = system_tokens + sum(
             estimate_tokens(self._extract_text(m)) for m in messages
         )
         self._last_reset_raw_tokens = original_tokens
-        reset_tokens = sum(
+        reset_tokens = system_tokens + sum(
             estimate_tokens(self._extract_text(m)) for m in fresh_messages
         )
         self._last_debug = {
@@ -726,6 +732,29 @@ class ContextManager:
         )
         self._save_state()
         return fresh_messages
+
+    @staticmethod
+    def _system_text(system: Any) -> str:
+        """Normalize an Anthropic ``system`` payload into plain text.
+
+        ``system`` may be ``None``, a plain string, or a list of text
+        blocks.  Mirrors :py:meth:`ContextAssembler._system_text` so the
+        proxy and assembler agree on what counts as system tokens.
+        """
+        if system is None:
+            return ""
+        if isinstance(system, str):
+            return system
+        if isinstance(system, list):
+            parts: list[str] = []
+            for block in system:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(str(block.get("text", "")))
+            return "\n".join(parts)
+        return str(system)
 
     def _extract_text(self, msg: dict) -> str:
         """Extract text content from a message, including tool blocks.
