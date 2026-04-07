@@ -262,7 +262,18 @@ class ContextAssembler:
         The critical recap before the user's message ensures that the
         most important facts are in the attention "hot zone" at the
         end of the sequence, even if they were originally from turn 2.
+
+        This method is idempotent: calling it more than once on the
+        same ``AssembledContext`` will not double-count wrapper tokens.
+        Callers may modify ``assembled.managed_blocks`` between calls
+        (e.g. to drop blocks for budget pressure) and re-invoke safely.
         """
+        # Reset prior wrapper accounting so this method is idempotent.
+        if assembled.wrapper_tokens:
+            assembled.total_tokens -= assembled.wrapper_tokens
+            assembled.budget_remaining += assembled.wrapper_tokens
+            assembled.wrapper_tokens = 0
+
         messages: list[dict] = []
         wrapper_tokens = 0
 

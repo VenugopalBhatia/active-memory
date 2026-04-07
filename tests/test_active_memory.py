@@ -502,6 +502,138 @@ class TestContextManagerAndProxyBehavior(unittest.TestCase):
             manager.process_messages(next_turn)
             self.assertEqual(manager.tree.size, 3)
 
+    def test_assistant_response_with_tool_use_blocks_does_not_reingest(self) -> None:
+        """Regression: when an assistant response mixes text + tool_use,
+        the fingerprint must use the original block list so the next
+        request (which replays those exact blocks) prefix-matches and
+        the assistant turn is not re-ingested as new content."""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ContextManager(
+                ProxyConfig(
+                    token_budget=1_000,
+                    embedder_provider="hash",
+                    state_dir=tmp,
+                )
+            )
+            user_one = [{"role": "user", "content": "Initial request " * 6}]
+            assistant_blocks = [
+                {"type": "text", "text": "Let me look that up. "},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "search",
+                    "input": {"query": "database choice"},
+                },
+                {"type": "text", "text": "Here is what I found."},
+            ]
+            assistant_response = {"content": assistant_blocks}
+
+            manager.process_messages(user_one)
+            tree_after_user = manager.tree.size
+
+            manager.ingest_assistant_response(assistant_response)
+            tree_after_ingest = manager.tree.size
+            self.assertGreater(tree_after_ingest, tree_after_user)
+
+            # The next request from the client replays the assistant
+            # response with the *original* block list, plus a new user
+            # turn. Only the new user turn should be ingested.
+            next_turn = user_one + [
+                {"role": "assistant", "content": assistant_blocks},
+                {"role": "user", "content": "Follow-up question " * 4},
+            ]
+            manager.process_messages(next_turn)
+
+            # Exactly one new tuple from the follow-up user message —
+            # not a re-ingestion of the assistant blocks.
+            self.assertEqual(manager.tree.size, tree_after_ingest + 1)
+
+    def test_streaming_response_reconstructs_tool_use_blocks(self) -> None:
+        """Regression: SSE streams must rebuild content blocks so that
+        text + tool_use responses fingerprint identically to what the
+        client will replay on the next request."""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ContextManager(
+                ProxyConfig(
+                    token_budget=1_000,
+                    embedder_provider="hash",
+                    state_dir=tmp,
+                )
+            )
+            user_one = [{"role": "user", "content": "Initial request " * 6}]
+            manager.process_messages(user_one)
+            tree_after_user = manager.tree.size
+
+            sse = "\n".join([
+                'data: {"type":"message_start","message":{"id":"m1"}}',
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me look that up. "}}',
+                'data: {"type":"content_block_stop","index":0}',
+                'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}',
+                'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":"}}',
+                'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"database choice\\"}"}}',
+                'data: {"type":"content_block_stop","index":1}',
+                'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}',
+                'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Here is what I found."}}',
+                'data: {"type":"content_block_stop","index":2}',
+                'data: {"type":"message_stop"}',
+                'data: [DONE]',
+            ])
+            manager.ingest_streaming_response(sse)
+            tree_after_stream = manager.tree.size
+            self.assertGreater(tree_after_stream, tree_after_user)
+
+            # Replay the same blocks the way Claude Code would on the
+            # next request — the assistant turn must prefix-match.
+            replay_blocks = [
+                {"type": "text", "text": "Let me look that up. "},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "search",
+                    "input": {"query": "database choice"},
+                },
+                {"type": "text", "text": "Here is what I found."},
+            ]
+            next_turn = user_one + [
+                {"role": "assistant", "content": replay_blocks},
+                {"role": "user", "content": "Follow-up question " * 4},
+            ]
+            manager.process_messages(next_turn)
+            self.assertEqual(manager.tree.size, tree_after_stream + 1)
+
+    def test_to_messages_is_idempotent_for_wrapper_token_accounting(self) -> None:
+        """Regression: calling ContextAssembler.to_messages twice on the
+        same AssembledContext must not double-count wrapper tokens."""
+        tree = SemanticBTree(
+            embedder=HashEmbedder(dim=8),
+            scorer=Scorer(),
+            config=BTreeConfig(max_tuples=4),
+        )
+        for i in range(8):
+            tree.insert(f"topic {i}", f"fact about topic {i} " * 4)
+
+        assembler = ContextAssembler(
+            tree,
+            AssemblerConfig(total_budget=2_000, pinned_reserve=200, recency_window=1),
+        )
+        conversation = [
+            {"role": "user", "content": "Tell me about topic 3"},
+            {"role": "assistant", "content": "Sure."},
+            {"role": "user", "content": "What about topic 5?"},
+        ]
+        query_emb = HashEmbedder(dim=8).embed(["What about topic 5?"])[0]
+        assembled = assembler.assemble(conversation, query_emb)
+
+        messages_first = assembler.to_messages("system", assembled)
+        total_after_first = assembled.total_tokens
+        wrappers_first = assembled.wrapper_tokens
+
+        messages_second = assembler.to_messages("system", assembled)
+        self.assertEqual(assembled.total_tokens, total_after_first)
+        self.assertEqual(assembled.wrapper_tokens, wrappers_first)
+        self.assertEqual(len(messages_first), len(messages_second))
+
     def test_proxy_handler_matches_messages_route_with_query_string(self) -> None:
         handler = ProxyHandler.__new__(ProxyHandler)
         handler.path = "/v1/messages?beta=true"

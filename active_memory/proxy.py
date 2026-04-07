@@ -452,9 +452,16 @@ class ContextManager:
         operational_context = self._build_operational_context()
         if operational_context:
             operational_tokens = estimate_tokens(operational_context)
+            total_budget = self.assembler.cfg.total_budget
+            # Drop lowest-priority managed blocks until the operational
+            # context block fits.  We rebuild ``optimised`` after dropping
+            # so the prompt actually reflects the accounting — popping
+            # from ``assembled.managed_blocks`` alone does not remove the
+            # blocks from a previously-built ``optimised`` list.
+            dropped_any = False
             while (
                 assembled.managed_blocks
-                and assembled.total_tokens + operational_tokens > self.assembler.cfg.total_budget
+                and assembled.total_tokens + operational_tokens > total_budget
             ):
                 dropped = assembled.managed_blocks.pop()
                 assembled.total_tokens -= dropped.token_cost
@@ -463,9 +470,15 @@ class ContextManager:
                     assembled.anchored_count = max(0, assembled.anchored_count - 1)
                 elif dropped.source == "dependency":
                     assembled.dependency_count = max(0, assembled.dependency_count - 1)
+                dropped_any = True
             assembled.tuples_included = len(assembled.managed_blocks)
 
-            if assembled.total_tokens + operational_tokens <= self.assembler.cfg.total_budget:
+            if dropped_any:
+                # Rebuild the message list now that managed_blocks shrank.
+                # to_messages is idempotent w.r.t. wrapper accounting.
+                optimised = self.assembler.to_messages(system, assembled)
+
+            if assembled.total_tokens + operational_tokens <= total_budget:
                 optimised.insert(0, {
                     "role": "user",
                     "content": operational_context,
@@ -949,40 +962,63 @@ class ContextManager:
 
         return "\n".join(lines) + "\n"
 
+    def _index_assistant_blocks(self, content_blocks: list[Any]) -> None:
+        """Index an assistant response and store its fingerprint.
+
+        We fingerprint using the *original* content block list so the
+        next request from the client (which replays Anthropic's exact
+        response shape) prefix-matches and we don't re-ingest.
+        """
+        text_parts: list[str] = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                text = block.get("text", "")
+                if text:
+                    text_parts.append(text)
+            elif btype == "tool_use":
+                name = block.get("name", "unknown_tool")
+                tool_input = block.get("input", {})
+                try:
+                    input_repr = json.dumps(tool_input, separators=(",", ":"))
+                except (TypeError, ValueError):
+                    input_repr = str(tool_input)
+                if len(input_repr) > 500:
+                    input_repr = input_repr[:500] + "..."
+                text_parts.append(f"[tool_use:{name}] {input_repr}")
+
+        assistant_text = " ".join(p for p in text_parts if p).strip()
+        if not assistant_text:
+            return
+
+        assistant_msg = {"role": "assistant", "content": content_blocks}
+        self._batch_insert_segments(self._segment_message("assistant", assistant_text))
+        self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
+        self._save_state()
+
     def ingest_assistant_response(self, response_data: dict[str, Any]) -> None:
         """Index a completed non-streaming assistant response immediately."""
         content_blocks = response_data.get("content")
         if not isinstance(content_blocks, list):
             return
-
-        text_parts: list[str] = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-                if text:
-                    text_parts.append(text)
-
-        assistant_text = " ".join(text_parts).strip()
-        if not assistant_text:
-            return
-
-        assistant_msg = {
-            "role": "assistant",
-            "content": [{"type": "text", "text": assistant_text}],
-        }
-        self._batch_insert_segments(self._segment_message("assistant", assistant_text))
-        self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
-        self._save_state()
+        self._index_assistant_blocks(content_blocks)
 
     def ingest_streaming_response(self, raw_sse: str) -> None:
-        """Parse an SSE stream and index the assistant text.
+        """Parse an SSE stream and index the assistant response.
 
-        Anthropic streaming sends ``content_block_delta`` events with
-        ``text_delta`` payloads.  We accumulate the text deltas and
-        ingest the result the same way ``ingest_assistant_response``
-        does for non-streamed replies.
+        Reconstructs the full ``content`` block list from
+        ``content_block_start`` / ``content_block_delta`` /
+        ``content_block_stop`` events so the resulting fingerprint
+        matches what the client will replay on the next request.
+        Handles both ``text_delta`` (text blocks) and
+        ``input_json_delta`` (tool_use input).
         """
-        text_parts: list[str] = []
+        content_blocks: list[dict] = []
+        current_block: dict | None = None
+        json_buf: list[str] = []
+
         for line in raw_sse.splitlines():
             if not line.startswith("data: "):
                 continue
@@ -995,24 +1031,34 @@ class ContextManager:
                 continue
 
             event_type = event.get("type", "")
-            if event_type == "content_block_delta":
+            if event_type == "content_block_start":
+                block = event.get("content_block")
+                if isinstance(block, dict):
+                    current_block = dict(block)
+                    json_buf = []
+                    content_blocks.append(current_block)
+            elif event_type == "content_block_delta" and current_block is not None:
                 delta = event.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    text = delta.get("text", "")
-                    if text:
-                        text_parts.append(text)
+                dtype = delta.get("type", "")
+                if dtype == "text_delta":
+                    current_block["text"] = (
+                        current_block.get("text", "") + delta.get("text", "")
+                    )
+                elif dtype == "input_json_delta":
+                    json_buf.append(delta.get("partial_json", ""))
+            elif event_type == "content_block_stop" and current_block is not None:
+                if current_block.get("type") == "tool_use" and json_buf:
+                    try:
+                        current_block["input"] = json.loads("".join(json_buf))
+                    except json.JSONDecodeError:
+                        # Leave whatever input was on the start event
+                        pass
+                current_block = None
+                json_buf = []
 
-        assistant_text = "".join(text_parts).strip()
-        if not assistant_text:
+        if not content_blocks:
             return
-
-        assistant_msg = {
-            "role": "assistant",
-            "content": [{"type": "text", "text": assistant_text}],
-        }
-        self._batch_insert_segments(self._segment_message("assistant", assistant_text))
-        self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
-        self._save_state()
+        self._index_assistant_blocks(content_blocks)
 
     def _save_state(self) -> None:
         state_dir = Path(self.cfg.state_dir)
