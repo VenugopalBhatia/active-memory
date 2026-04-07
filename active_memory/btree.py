@@ -124,6 +124,7 @@ class SemanticBTree:
         )
 
         leaf = self._find_leaf(self.root, emb)
+        self._prepare_leaf_for_insert(leaf)
         leaf.tuples.append(t)
         leaf.recompute_centroid()
         self._size += 1
@@ -141,6 +142,7 @@ class SemanticBTree:
             t.token_cost = estimate_tokens(t.value_text)
 
         leaf = self._find_leaf(self.root, t.key_emb)
+        self._prepare_leaf_for_insert(leaf)
         leaf.tuples.append(t)
         leaf.recompute_centroid()
         self._size += 1
@@ -217,7 +219,9 @@ class SemanticBTree:
                 out.append(list(node.tuples))
         else:
             if node.summary:
+                # Summary replaces the subtree — don't walk into it.
                 out.append([node.summary])
+                return
             for child in node.children:
                 self._collect_clusters(child, out)
 
@@ -252,6 +256,12 @@ class SemanticBTree:
                     best_sim = sim
                     best_child = child
         return self._find_leaf(best_child, emb)
+
+    def _prepare_leaf_for_insert(self, leaf: BTreeNode) -> None:
+        """Re-open a compressed leaf before inserting fresh tuples."""
+        if leaf.summary is not None:
+            leaf.summary = None
+            self._size = max(0, self._size - 1)
 
     def _split(self, node: BTreeNode) -> None:
         """Split a leaf node into two children using 2-means."""
@@ -327,16 +337,22 @@ class SemanticBTree:
                     s = self.scorer.score(t, query_emb)
                     out.append((s, t))
         else:
-            # Also include this node's summary if it has one
+            # If this internal node has a summary, it already represents
+            # its subtree — score the summary and skip the children to
+            # avoid double-counting.
             if node.summary:
                 s = self.scorer.score(node.summary, query_emb)
                 out.append((s, node.summary))
+                return
             for child in node.children:
                 self._collect_scored(child, query_emb, out)
 
     def _collect_all(self, node: BTreeNode, out: list[KVTuple]) -> None:
         if node.summary:
+            # A summary replaces the subtree it was compressed from;
+            # don't also walk into the (normally empty) tuples/children.
             out.append(node.summary)
+            return
         for t in node.tuples:
             out.append(t)
         for child in node.children:
@@ -355,7 +371,7 @@ class SemanticBTree:
                 score = self.scorer.score(t, query_emb)
                 if score < self.cfg.compress_threshold:
                     evicted.append(t)
-                    self._size -= 1
+                    self._size = max(0, self._size - 1)
                 else:
                     keep.append(t)
             node.tuples = keep
@@ -411,8 +427,10 @@ class SemanticBTree:
                     token_cost=estimate_tokens(summary_text),
                 )
 
-                # Replace child contents with summary
-                self._size -= len(child_tuples)
+                # Replace child contents with summary.
+                # Use max(0, ...) to guard against double-counting if
+                # prune already removed some of these tuples this cycle.
+                self._size = max(0, self._size - len(child_tuples))
                 child.tuples = []
                 child.children = []
                 child.summary = summary_tuple

@@ -367,6 +367,7 @@ class GroundedAssembler:
         self.scorer = scorer
         self.cfg = config or GroundingConfig()
         self.injector = ProvenanceInjector(tree, scorer)
+        self.last_blocks: list[GroundedBlock] = []
         self.verifier = ResponseVerifier(
             tree,
             embedder,
@@ -392,6 +393,7 @@ class GroundedAssembler:
         blocks = self.injector.build_grounded_context(
             query_emb, top_k=50, conversation=conversation
         )
+        self.last_blocks = list(blocks)
 
         # Format with confidence tags
         grounded_context = self.injector.format_grounded_context(blocks)

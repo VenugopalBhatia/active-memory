@@ -207,8 +207,6 @@ class ContextManager:
 
     def _segment_message(self, role: str, content: str) -> list[tuple[str, str]]:
         """Split a message into indexable segments."""
-        import re
-
         if not content.strip():
             return []
 
@@ -280,6 +278,25 @@ class ContextManager:
             + "\n".join(lines)
         )
 
+    @staticmethod
+    def _normalize_message_content(content: Any) -> Any:
+        """Normalize content for stable dedupe across SDK message shapes."""
+        if isinstance(content, str):
+            return [{"type": "text", "text": content.strip()}]
+        if isinstance(content, list):
+            normalized: list[Any] = []
+            for block in content:
+                if isinstance(block, str):
+                    normalized.append({"type": "text", "text": block.strip()})
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    block_copy = dict(block)
+                    block_copy["text"] = str(block_copy.get("text", "")).strip()
+                    normalized.append(block_copy)
+                else:
+                    normalized.append(block)
+            return normalized
+        return content
+
     def process_messages(
         self,
         messages: list[dict],
@@ -311,7 +328,8 @@ class ContextManager:
         self._update_operational_facts(messages[prefix_len:])
         self._message_fingerprints = incoming_fingerprints
 
-        self._turn_count += 1
+        if prefix_len < len(incoming_fingerprints):
+            self._turn_count += 1
         if self.cfg.verbose:
             print(
                 f"  [proxy] registered turn {self._turn_count} "
@@ -323,7 +341,7 @@ class ContextManager:
         # No point managing context if it already fits comfortably.
         # Only activate when raw conversation exceeds 50% of budget.
         raw_tokens = sum(
-            len(self._extract_text(m)) // 4 for m in messages
+            estimate_tokens(self._extract_text(m)) for m in messages
         )
         activation_threshold = self.cfg.token_budget // 2
 
@@ -362,9 +380,11 @@ class ContextManager:
             self._reset_count > 0
             and (self._turn_count - self._last_reset_turn) <= self.cfg.reset_cooldown_turns
         )
+        reset_suppressed_this_turn = False
 
         if raw_tokens > reset_threshold_tokens:
             if reset_cooldown_active or raw_tokens < reset_growth_floor:
+                reset_suppressed_this_turn = True
                 self._last_debug = {
                     "turn": self._turn_count,
                     "action": "managed_reset_suppressed",
@@ -408,24 +428,54 @@ class ContextManager:
             assembled = self.assembler.assemble(messages, query_emb)
         else:
             # Not enough context to manage — pass through
+            self._last_debug = {
+                "turn": self._turn_count,
+                "action": "passthrough",
+                "original_tokens": raw_tokens,
+                "reason": "empty_tree_or_no_user_message",
+                "tree_size": self.tree.size,
+            }
+            self._record_usage(
+                action="passthrough",
+                raw_tokens=raw_tokens,
+                sent_tokens=raw_tokens,
+                reset_suppressed=reset_suppressed_this_turn,
+            )
             self._save_state()
             return messages
 
         # -- 4. Build optimised message list --
         optimised = self.assembler.to_messages(
-            system if isinstance(system, str) else "",
+            system,
             assembled,
         )
         operational_context = self._build_operational_context()
         if operational_context:
-            optimised.insert(0, {
-                "role": "user",
-                "content": operational_context,
-            })
+            operational_tokens = estimate_tokens(operational_context)
+            while (
+                assembled.managed_blocks
+                and assembled.total_tokens + operational_tokens > self.assembler.cfg.total_budget
+            ):
+                dropped = assembled.managed_blocks.pop()
+                assembled.total_tokens -= dropped.token_cost
+                assembled.budget_remaining += dropped.token_cost
+                if dropped.source == "anchored":
+                    assembled.anchored_count = max(0, assembled.anchored_count - 1)
+                elif dropped.source == "dependency":
+                    assembled.dependency_count = max(0, assembled.dependency_count - 1)
+            assembled.tuples_included = len(assembled.managed_blocks)
+
+            if assembled.total_tokens + operational_tokens <= self.assembler.cfg.total_budget:
+                optimised.insert(0, {
+                    "role": "user",
+                    "content": operational_context,
+                })
+                assembled.total_tokens += operational_tokens
+                assembled.budget_remaining -= operational_tokens
 
         # -- 5. Capture debug info --
         original_tokens = sum(
-            len(self._extract_text(m)) // 4 for m in messages
+            estimate_tokens(self._extract_text(m)) for m in messages
         )
         selected = [
             {
@@ -484,6 +534,7 @@ class ContextManager:
             action=self._last_debug["action"],
             raw_tokens=original_tokens,
             sent_tokens=assembled.total_tokens,
+            reset_suppressed=reset_suppressed_this_turn,
         )
         return optimised
 
@@ -622,11 +673,11 @@ class ContextManager:
 
         # -- 5. Capture debug info and log the reset --
         original_tokens = sum(
-            len(self._extract_text(m)) // 4 for m in messages
+            estimate_tokens(self._extract_text(m)) for m in messages
         )
         self._last_reset_raw_tokens = original_tokens
         reset_tokens = sum(
-            len(self._extract_text(m)) // 4 for m in fresh_messages
+            estimate_tokens(self._extract_text(m)) for m in fresh_messages
         )
         self._last_debug = {
             "turn": self._turn_count,
@@ -664,25 +715,66 @@ class ContextManager:
         return fresh_messages
 
     def _extract_text(self, msg: dict) -> str:
-        """Extract text content from a message (handles string and list content)."""
+        """Extract text content from a message, including tool blocks.
+
+        Handles all Anthropic content block types:
+          - string content (plain text)
+          - text blocks (type=text)
+          - tool_use blocks (type=tool_use): extracts tool name + JSON input
+          - tool_result blocks (type=tool_result): extracts text content
+        """
         content = msg.get("content", "")
         if isinstance(content, str):
             return content
         if isinstance(content, list):
             parts = []
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-            return " ".join(parts)
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    block_type = block.get("type", "")
+                    if block_type == "text":
+                        parts.append(block.get("text", ""))
+                    elif block_type == "tool_use":
+                        # Index the tool name and a compact repr of its input
+                        name = block.get("name", "unknown_tool")
+                        tool_input = block.get("input", {})
+                        input_repr = json.dumps(tool_input, separators=(",", ":"))
+                        # Cap the input repr to avoid bloating the index
+                        if len(input_repr) > 500:
+                            input_repr = input_repr[:500] + "..."
+                        parts.append(f"[tool_use:{name}] {input_repr}")
+                    elif block_type == "tool_result":
+                        # tool_result content can be string or list of blocks
+                        result_content = block.get("content", "")
+                        if isinstance(result_content, str):
+                            parts.append(result_content)
+                        elif isinstance(result_content, list):
+                            for sub in result_content:
+                                if isinstance(sub, str):
+                                    parts.append(sub)
+                                elif isinstance(sub, dict) and sub.get("type") == "text":
+                                    parts.append(sub.get("text", ""))
+            return " ".join(p for p in parts if p)
         return str(content)
 
     def _fingerprint_message(self, msg: dict) -> str:
-        """Stable message fingerprint for cross-request dedupe."""
+        """Stable message fingerprint for cross-request dedupe.
+
+        Normalizes plain-text messages so that ``"hi"`` and
+        ``[{"type":"text","text":"hi"}]`` hash identically — the
+        Anthropic API returns assistant turns as a list of blocks, but
+        client SDKs sometimes replay them as bare strings. Tool-bearing
+        messages keep their structural distinctness because the
+        non-text blocks remain in the normalized payload.
+        """
         role = str(msg.get("role", "user"))
-        content = self._extract_text(msg).strip()
+        content = msg.get("content", "")
+        normalized = self._normalize_message_content(content)
         payload = json.dumps(
-            {"role": role, "content": content},
+            {"role": role, "content": normalized},
             ensure_ascii=True,
+            sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
@@ -738,7 +830,14 @@ class ContextManager:
         lines.append("           Legend: H raw history  P proxy sent  ◆ overlap")
         return lines
 
-    def _record_usage(self, *, action: str, raw_tokens: int, sent_tokens: int) -> None:
+    def _record_usage(
+        self,
+        *,
+        action: str,
+        raw_tokens: int,
+        sent_tokens: int,
+        reset_suppressed: bool = False,
+    ) -> None:
         """Persist per-turn usage for the /usage endpoint."""
         events: list[str] = []
         if self._activation_turn is None and action != "passthrough":
@@ -746,10 +845,10 @@ class ContextManager:
             events.append("A")
         if action == "context_reset":
             events.append("R")
-        elif action == "managed_reset_suppressed":
-            events.append("S")
         elif action == "passthrough":
             events.append("P")
+        if reset_suppressed:
+            events.append("S")
 
         self._usage_history.append({
             "turn": self._turn_count,
@@ -867,13 +966,57 @@ class ContextManager:
         if not assistant_text:
             return
 
-        assistant_msg = {"role": "assistant", "content": assistant_text}
+        assistant_msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": assistant_text}],
+        }
+        self._batch_insert_segments(self._segment_message("assistant", assistant_text))
+        self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
+        self._save_state()
+
+    def ingest_streaming_response(self, raw_sse: str) -> None:
+        """Parse an SSE stream and index the assistant text.
+
+        Anthropic streaming sends ``content_block_delta`` events with
+        ``text_delta`` payloads.  We accumulate the text deltas and
+        ingest the result the same way ``ingest_assistant_response``
+        does for non-streamed replies.
+        """
+        text_parts: list[str] = []
+        for line in raw_sse.splitlines():
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = event.get("type", "")
+            if event_type == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        text_parts.append(text)
+
+        assistant_text = "".join(text_parts).strip()
+        if not assistant_text:
+            return
+
+        assistant_msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": assistant_text}],
+        }
         self._batch_insert_segments(self._segment_message("assistant", assistant_text))
         self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
         self._save_state()
 
     def _save_state(self) -> None:
-        Path(self.cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        state_dir = Path(self.cfg.state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
         tuples = self.tree.all_tuples()
         state = {
             "turn_count": self._turn_count,
@@ -902,7 +1045,11 @@ class ContextManager:
                 for t in tuples
             ],
         }
-        self._state_path.write_text(json.dumps(state))
+        # Atomic write: write to temp file then rename to avoid corruption
+        # if the process is killed mid-write.
+        tmp_path = self._state_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(state))
+        tmp_path.replace(self._state_path)
 
     def _load_state(self) -> None:
         if not self._state_path.exists():
@@ -1055,7 +1202,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length)
         route = self._request_path()
 
-        if self.proxy_config.verbose:
+        if getattr(self, "proxy_config", None) and self.proxy_config.verbose:
             print(
                 f"  [proxy] inbound POST {route} "
                 f"(content-length={content_length})",
@@ -1248,12 +1395,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         self.send_header(key, val)
                 self.end_headers()
                 if is_stream:
+                    stream_buf = bytearray()
                     while True:
                         chunk = response.read(8192)
                         if not chunk:
                             break
+                        stream_buf.extend(chunk)
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                    # Parse accumulated SSE stream and ingest assistant text
+                    try:
+                        self.context_manager.ingest_streaming_response(
+                            stream_buf.decode("utf-8", errors="replace")
+                        )
+                    except Exception:
+                        if self.proxy_config.verbose:
+                            print(
+                                "  [proxy] Skipped assistant ingestion from stream",
+                                file=sys.stderr,
+                            )
                 else:
                     response_body = response.read()
                     try:

@@ -112,6 +112,8 @@ class ActiveMemoryMiddleware:
 
         grounding_report = None
         verification = None
+        tuples_considered = 0
+        tuples_included = 0
 
         if self.grounder and self.cfg.grounding.provenance_injection:
             # Use grounded assembler with confidence tags
@@ -125,6 +127,9 @@ class ActiveMemoryMiddleware:
             assembled_tokens = sum(
                 estimate_tokens(self._message_text(m)) for m in messages
             )
+            grounded_blocks = getattr(self.grounder, "last_blocks", [])
+            tuples_considered = len(grounded_blocks)
+            tuples_included = len(grounded_blocks)
         else:
             # Standard assembler
             system_prompt = self.cfg.system_prompt
@@ -133,6 +138,8 @@ class ActiveMemoryMiddleware:
                 self.cfg.system_prompt, assembled
             )
             assembled_tokens = assembled.total_tokens
+            tuples_considered = assembled.tuples_considered
+            tuples_included = assembled.tuples_included
 
         # -- call Anthropic --
         response = self.client.generate(
@@ -196,8 +203,8 @@ class ActiveMemoryMiddleware:
                 tree_depth=self.tree.depth(),
                 tokens_assembled=assembled_tokens,
                 tokens_remaining=self.cfg.assembler.total_budget - assembled_tokens,
-                tuples_considered=self.tree.size,
-                tuples_included=self.tree.size,
+                tuples_considered=tuples_considered,
+                tuples_included=tuples_included,
                 turn=self._turn_count,
             ),
             verification=verification,
@@ -356,7 +363,10 @@ class ActiveMemoryMiddleware:
 
     @staticmethod
     def _message_text(message: dict[str, Any]) -> str:
-        """Normalize Anthropic-style message content into plain text."""
+        """Normalize Anthropic-style message content into plain text.
+
+        Handles text, tool_use, and tool_result blocks.
+        """
         content = message.get("content", "")
         if isinstance(content, str):
             return content
@@ -365,8 +375,24 @@ class ActiveMemoryMiddleware:
             for item in content:
                 if isinstance(item, str):
                     parts.append(item)
-                elif isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
+                elif isinstance(item, dict):
+                    item_type = item.get("type", "")
+                    if item_type == "text":
+                        parts.append(str(item.get("text", "")))
+                    elif item_type == "tool_use":
+                        name = item.get("name", "")
+                        inp = item.get("input", {})
+                        parts.append(f"[tool_use:{name}] {inp}")
+                    elif item_type == "tool_result":
+                        rc = item.get("content", "")
+                        if isinstance(rc, str):
+                            parts.append(rc)
+                        elif isinstance(rc, list):
+                            for sub in rc:
+                                if isinstance(sub, str):
+                                    parts.append(sub)
+                                elif isinstance(sub, dict) and sub.get("type") == "text":
+                                    parts.append(str(sub.get("text", "")))
             return "\n".join(part for part in parts if part)
         return str(content)
 

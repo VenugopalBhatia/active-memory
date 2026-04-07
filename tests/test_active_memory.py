@@ -218,6 +218,21 @@ class TestSemanticBTreeBehavior(unittest.TestCase):
         self.assertTrue(any(t.key_text.startswith("summary:") for t in all_tuples))
         self.assertNotEqual(original_ids, {t.id for t in all_tuples})
 
+    def test_insert_after_compression_replaces_summary_with_live_tuple(self) -> None:
+        tree, embedder, _ = make_tree(max_tuples=2, threshold=0.9)
+        for i in range(5):
+            t = tree.insert(f"old note {i}", f"cold fact {i}")
+            t.last_accessed = time.time() - 100_000
+
+        tree.compress_cold_subtrees(
+            query_emb=embedder.embed(["fresh topic"])[0],
+        )
+        tree.insert("new note", "fresh fact after compression")
+
+        all_keys = {t.key_text for t in tree.all_tuples()}
+        self.assertIn("new note", all_keys)
+        self.assertTrue(any("new note" in {t.key_text for t in cluster} for cluster in tree.tuples_by_cluster()))
+
 
 class TestAssemblerBehavior(unittest.TestCase):
     def test_anchor_includes_relevant_low_priority_tuple(self) -> None:
@@ -712,6 +727,24 @@ class TestMiddlewareBehavior(unittest.TestCase):
 
         self.assertEqual(response.text, "plain answer")
         self.assertEqual(mw._turn_count, 1)
+
+    def test_grounded_prompt_reports_nonzero_tuple_stats(self) -> None:
+        cfg = MiddlewareConfig()
+        cfg.grounding.enabled = True
+        cfg.grounding.provenance_injection = True
+        cfg.grounding.post_verification = False
+        client = _RecordingModelClient(["grounded answer"])
+        mw = ActiveMemoryMiddleware(client=client, embedder=HashEmbedder(dim=8), config=cfg)
+        for i in range(6):
+            mw.tree.insert(f"seed:{i}", f"seed fact {i}")
+
+        response = mw.send("What did we decide?")
+
+        self.assertGreater(response.context_stats.tuples_considered, 0)
+        self.assertEqual(
+            response.context_stats.tuples_considered,
+            response.context_stats.tuples_included,
+        )
 
 
 class TestModelClientProviders(unittest.TestCase):
