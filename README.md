@@ -30,6 +30,15 @@ pip install .
 # With optional embedding/model providers
 pip install '.[anthropic,openai]'
 
+# With Gemini support
+pip install '.[gemini]'
+
+# With local semantic embeddings (sentence-transformers)
+pip install '.[local]'
+
+# Or install multiple extras together
+pip install '.[anthropic,openai,gemini,local]'
+
 # With dev dependencies (tests)
 pip install '.[dev]'
 ```
@@ -52,14 +61,29 @@ The proxy forwards authentication headers from the client. If you're logged into
 
 ### Embedding providers
 
-By default, `active-memory` uses OpenAI embeddings when `OPENAI_API_KEY` is set and the `openai` extra is installed. If not, it falls back to a deterministic hash embedder for development and testing.
+By default, `active-memory` chooses embeddings in this order:
+
+1. OpenAI embeddings, if `OPENAI_API_KEY` is set and the `openai` extra is installed
+2. Google Gemini embeddings, if `GEMINI_API_KEY` or `GOOGLE_API_KEY` is set and the `gemini` extra is installed
+3. A local sentence-transformer model (`all-MiniLM-L6-v2`), if the `local` extra is installed
+4. A deterministic hash embedder as the final non-semantic fallback
+
+That means you can get real semantic embeddings even without an API key by installing the local extra.
 
 ```bash
 # Use OpenAI embeddings (recommended for quality)
 pip install 'active-memory[openai]'
 export OPENAI_API_KEY=sk-...
 
-# Or force the hash embedder (no API key needed, non-semantic)
+# Use Gemini embeddings
+pip install 'active-memory[gemini]'
+export GEMINI_API_KEY=...
+
+# Use a local semantic embedder with no API key
+pip install 'active-memory[local]'
+active-memory --embedder local
+
+# Or force the hash embedder (no model download, non-semantic)
 active-memory --embedder hash
 ```
 
@@ -152,7 +176,7 @@ active-memory [OPTIONS]
   --host         Bind address (default: 127.0.0.1)
   --budget       Token budget for managed context (default: 18,000)
   --recency      Recent turns to always pin (default: 3)
-  --embedder     auto | hash | openai (default: auto)
+  --embedder     auto | hash | openai | local | gemini (default: auto)
   --embed-model  OpenAI embedding model (default: text-embedding-3-small)
   --embed-dim    Hash embedding dimension (default: 64)
   --upstream     Upstream API URL (default: https://api.anthropic.com)
@@ -257,6 +281,8 @@ Recency decays exponentially with a 30-minute half-life. Frequency is log-scaled
 active-memory-chat                                    # standalone chat with managed context
 active-memory-chat --provider openai --model gpt-4.1  # use OpenAI instead
 active-memory-chat --provider ollama --model llama3    # use local Ollama models
+active-memory-chat --provider gemini                   # use Gemini with default model
+active-memory-chat --provider codex                    # use OpenAI Codex via Responses API
 active-memory-chat --session myproject --resume        # resume a named session
 active-memory-chat --ingest src/main.py README.md      # pre-load files
 ```
@@ -268,6 +294,12 @@ active-memory-chat --ingest src/main.py README.md      # pre-load files
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # For OpenAI
+export OPENAI_API_KEY=sk-...
+
+# For Gemini
+export GEMINI_API_KEY=...
+
+# For Codex (uses OpenAI credentials)
 export OPENAI_API_KEY=sk-...
 
 # For Ollama (no key needed, runs locally)
