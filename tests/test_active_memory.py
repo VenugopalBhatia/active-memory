@@ -52,6 +52,12 @@ from active_memory.long_context_bench import build_long_context_scenario
 from active_memory.prepare_release import prepare
 from active_memory.proxy import ContextManager, ProxyConfig, ProxyHandler
 from active_memory.types import HashEmbedder
+from active_memory.model_clients import (
+    DEFAULT_PROVIDER_MODELS,
+    PROVIDER_AUTH_ENV_VARS,
+    PROVIDER_PACKAGE_EXTRAS,
+    GeminiModelClient,
+)
 
 
 class SemanticTestEmbedder:
@@ -808,9 +814,21 @@ class TestAssemblerAndGroundingBehavior(unittest.TestCase):
 
 
 class TestEmbeddingProviderSelection(unittest.TestCase):
-    def test_create_embedder_auto_falls_back_to_hash_without_openai_key(self) -> None:
+    def test_create_embedder_auto_uses_local_without_api_keys(self) -> None:
+        fake_embedder = SemanticTestEmbedder()
         with patch.dict("os.environ", {}, clear=True):
-            spec = create_embedder("auto", dim=24)
+            with patch("active_memory.embeddings.LocalModelEmbedder", return_value=fake_embedder):
+                spec = create_embedder("auto", dim=24)
+
+        self.assertEqual(spec.provider, "local")
+        self.assertTrue(spec.semantic)
+        self.assertIs(spec.embedder, fake_embedder)
+        self.assertIn("Local sentence-transformer", spec.description)
+
+    def test_create_embedder_auto_falls_back_to_hash_when_local_unavailable(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("active_memory.embeddings.LocalModelEmbedder", side_effect=ImportError("missing")):
+                spec = create_embedder("auto", dim=24)
 
         self.assertEqual(spec.provider, "hash")
         self.assertFalse(spec.semantic)
@@ -825,10 +843,69 @@ class TestEmbeddingProviderSelection(unittest.TestCase):
         stream = io.StringIO()
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
             with patch("active_memory.embeddings.OpenAIEmbedder", side_effect=RuntimeError("boom")):
-                spec = create_embedder("auto", verbose=True, stream=stream)
+                with patch("active_memory.embeddings.LocalModelEmbedder", side_effect=ImportError("missing")):
+                    spec = create_embedder("auto", verbose=True, stream=stream)
 
         self.assertEqual(spec.provider, "hash")
-        self.assertIn("Falling back to hash embedder", stream.getvalue())
+        output = stream.getvalue()
+        self.assertIn("OpenAI unavailable", output)
+        self.assertIn("falling back to hash", output)
+
+    def test_create_embedder_auto_tries_gemini_before_local(self) -> None:
+        fake_embedder = SemanticTestEmbedder()
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}, clear=True):
+            with patch("active_memory.embeddings.GeminiEmbedder", side_effect=RuntimeError("gemini boom")):
+                with patch("active_memory.embeddings.LocalModelEmbedder", return_value=fake_embedder):
+                    spec = create_embedder("auto", verbose=True, stream=io.StringIO())
+
+        self.assertEqual(spec.provider, "local")
+        self.assertIs(spec.embedder, fake_embedder)
+
+
+class _FakeGeminiResponse:
+    def __init__(self) -> None:
+        self.text = "gemini ok"
+        self.usage_metadata = type(
+            "UsageMetadata",
+            (),
+            {"prompt_token_count": 13, "candidates_token_count": 7},
+        )()
+
+
+class _FakeGeminiClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.models = type("Models", (), {"generate_content": self._generate_content})()
+
+    def _generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeGeminiResponse()
+
+
+class TestModelClientProviders(unittest.TestCase):
+    def test_provider_defaults_cover_new_providers(self) -> None:
+        self.assertEqual(DEFAULT_PROVIDER_MODELS["gemini"], "gemini-2.5-flash")
+        self.assertEqual(DEFAULT_PROVIDER_MODELS["codex"], "gpt-5-codex")
+        self.assertEqual(PROVIDER_PACKAGE_EXTRAS["codex"], "openai")
+        self.assertEqual(PROVIDER_AUTH_ENV_VARS["gemini"], "GEMINI_API_KEY or GOOGLE_API_KEY")
+
+    def test_create_model_client_gemini_accepts_injected_client(self) -> None:
+        fake_client = _FakeGeminiClient()
+        with patch.dict("os.environ", {}, clear=True):
+            client = create_model_client("gemini", client=fake_client)
+
+        self.assertIsInstance(client, GeminiModelClient)
+        response = client.generate(
+            model="gemini-2.5-flash",
+            max_tokens=32,
+            messages=[{"role": "user", "content": "hello"}],
+            system="Be brief.",
+        )
+
+        self.assertEqual(response.text, "gemini ok")
+        self.assertEqual(response.input_tokens, 13)
+        self.assertEqual(response.output_tokens, 7)
+        self.assertEqual(fake_client.calls[0]["model"], "gemini-2.5-flash")
 
 
 class _FakeAnthropicResponse:

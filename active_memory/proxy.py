@@ -1605,9 +1605,9 @@ Example:
                         help="Number of recent turns to always include")
     parser.add_argument(
         "--embedder",
-        choices=["auto", "hash", "openai"],
+        choices=["auto", "hash", "openai", "local", "gemini"],
         default="auto",
-        help="Embedding provider (default: auto, prefers OpenAI when configured)",
+        help="Embedding provider (default: auto). Prefers OpenAI > Gemini > local > hash",
     )
     parser.add_argument(
         "--embed-model",

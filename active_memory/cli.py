@@ -554,7 +554,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "ollama"],
+        choices=["anthropic", "openai", "ollama", "gemini", "codex"],
         default="anthropic",
         help="Model provider (default: anthropic). 'ollama' uses local Ollama server",
     )
@@ -576,9 +576,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--embedder",
-        choices=["auto", "hash", "openai"],
+        choices=["auto", "hash", "openai", "local", "gemini"],
         default="auto",
-        help="Embedding provider (default: auto, prefers OpenAI when configured)",
+        help="Embedding provider (default: auto). Prefers OpenAI > Gemini > local > hash",
     )
     parser.add_argument(
         "--embed-dim",
@@ -605,14 +605,10 @@ def main() -> None:
     args = parser.parse_args()
 
     # -- Resolve default model per provider --
-    _user_passed_model = args.model is not None
-    DEFAULT_MODELS = {
-        "anthropic": "claude-sonnet-4-20250514",
-        "openai": "gpt-4o-mini",
-        "ollama": "llama3.2",
-    }
+    from .model_clients import DEFAULT_PROVIDER_MODELS, PROVIDER_AUTH_ENV_VARS, PROVIDER_PACKAGE_EXTRAS
+
     if args.model is None:
-        args.model = DEFAULT_MODELS.get(args.provider, "gpt-4o-mini")
+        args.model = DEFAULT_PROVIDER_MODELS.get(args.provider, "gpt-4o-mini")
 
     # -- Set up model client --
     from .model_clients import create_model_client
@@ -620,7 +616,7 @@ def main() -> None:
     try:
         client = create_model_client(args.provider, base_url=args.base_url)
     except ImportError:
-        pkg = "openai" if args.provider == "ollama" else args.provider
+        pkg = PROVIDER_PACKAGE_EXTRAS.get(args.provider, args.provider)
         print(f"{C.RED}Error: '{pkg}' package not installed.{C.RESET}")
         print(f"{C.DIM}  pip install active-memory[{pkg}]{C.RESET}")
         sys.exit(1)
@@ -632,7 +628,8 @@ def main() -> None:
         elif args.provider == "ollama":
             print(f"{C.DIM}  Make sure Ollama is running: ollama serve{C.RESET}")
         else:
-            print(f"{C.DIM}  export OPENAI_API_KEY=sk-...{C.RESET}")
+            env_var = PROVIDER_AUTH_ENV_VARS.get(args.provider, "OPENAI_API_KEY")
+            print(f"{C.DIM}  export {env_var}=...{C.RESET}")
         sys.exit(1)
 
     # -- Set up embedder --

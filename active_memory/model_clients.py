@@ -11,6 +11,31 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 
+DEFAULT_PROVIDER_MODELS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-20250514",
+    "openai": "gpt-4o-mini",
+    "ollama": "llama3.2",
+    "gemini": "gemini-2.5-flash",
+    "codex": "gpt-5-codex",
+}
+
+
+PROVIDER_PACKAGE_EXTRAS: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "ollama": "openai",
+    "gemini": "gemini",
+    "codex": "openai",
+}
+
+
+PROVIDER_AUTH_ENV_VARS: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY or GOOGLE_API_KEY",
+    "codex": "OPENAI_API_KEY",
+}
+
+
 @dataclass
 class GeneratedResponse:
     text: str
@@ -204,6 +229,135 @@ class OpenAIModelClient:
         )
 
 
+class GeminiModelClient:
+    """Google Gemini model client using the google-genai SDK."""
+
+    provider = "gemini"
+
+    def __init__(self, client: Any | None = None, api_key: str | None = None) -> None:
+        if client is None:
+            from google import genai
+
+            client = genai.Client(api_key=api_key)
+        self._client = client
+
+    def generate(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> GeneratedResponse:
+        try:
+            from google.genai import types
+        except ImportError:
+            contents = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                gemini_role = "model" if role == "assistant" else "user"
+                text = _coerce_text(msg.get("content", ""))
+                contents.append({
+                    "role": gemini_role,
+                    "parts": [{"text": text}],
+                })
+            config: Any = {"max_output_tokens": max_tokens}
+            if system:
+                config["system_instruction"] = system
+        else:
+            contents = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                # Gemini uses "user" and "model" roles
+                gemini_role = "model" if role == "assistant" else "user"
+                text = _coerce_text(msg.get("content", ""))
+                contents.append(types.Content(
+                    role=gemini_role,
+                    parts=[types.Part(text=text)],
+                ))
+
+            config = types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+            )
+            if system:
+                config.system_instruction = system
+
+        response = self._client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+
+        text = response.text or ""
+        usage = getattr(response, "usage_metadata", None)
+        return GeneratedResponse(
+            text=text,
+            raw=response,
+            input_tokens=_extract_usage_value(
+                usage, "prompt_token_count", "input_tokens",
+            ),
+            output_tokens=_extract_usage_value(
+                usage, "candidates_token_count", "output_tokens",
+            ),
+        )
+
+
+class CodexModelClient:
+    """OpenAI Codex client using the Responses API."""
+
+    provider = "codex"
+
+    def __init__(self, client: Any | None = None) -> None:
+        if client is None:
+            from openai import OpenAI
+
+            client = OpenAI()
+        self._client = client
+
+    def generate(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> GeneratedResponse:
+        input_items: list[dict[str, Any]] = []
+        if system:
+            input_items.append({"role": "system", "content": system})
+        for msg in messages:
+            input_items.append({
+                "role": str(msg.get("role", "user")),
+                "content": _coerce_text(msg.get("content", "")),
+            })
+
+        response = self._client.responses.create(
+            model=model,
+            input=input_items,
+            max_output_tokens=max_tokens,
+            **kwargs,
+        )
+
+        # Extract text from response output items
+        text_parts: list[str] = []
+        for item in getattr(response, "output", []):
+            if getattr(item, "type", None) == "message":
+                for part in getattr(item, "content", []):
+                    if getattr(part, "type", None) == "output_text":
+                        text_parts.append(part.text)
+        text = "\n".join(text_parts)
+
+        usage = getattr(response, "usage", None)
+        return GeneratedResponse(
+            text=text,
+            raw=response,
+            input_tokens=_extract_usage_value(usage, "input_tokens"),
+            output_tokens=_extract_usage_value(usage, "output_tokens"),
+        )
+
+
 def create_model_client(
     provider: str = "anthropic",
     *,
@@ -226,5 +380,13 @@ def create_model_client(
     if chosen == "ollama":
         url = base_url or "http://localhost:11434/v1"
         return OpenAIModelClient(base_url=url)
+    if chosen == "gemini":
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key and client is None:
+            raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY not set")
+        return GeminiModelClient(client=client, api_key=api_key)
+    if chosen == "codex":
+        if not os.environ.get("OPENAI_API_KEY") and client is None:
+            raise RuntimeError("OPENAI_API_KEY not set (required for Codex)")
+        return CodexModelClient(client=client)
     raise ValueError(f"Unsupported model provider: {provider}")
-

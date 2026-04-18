@@ -9,15 +9,18 @@ Quick start:
     ANTHROPIC_BASE_URL=http://localhost:8080 claude   # use it
 """
 
-from .types import KVTuple, Embedder, HashEmbedder, cosine_sim, estimate_tokens
+from .types import KVTuple, Embedder, HashEmbedder, LocalModelEmbedder, cosine_sim, estimate_tokens
 from .embeddings import (
     DEFAULT_OPENAI_EMBEDDING_MODEL,
     EmbedderSpec,
+    GeminiEmbedder,
     OpenAIEmbedder,
     create_embedder,
 )
 from .model_clients import (
     AnthropicModelClient,
+    CodexModelClient,
+    GeminiModelClient,
     OpenAIModelClient,
     ModelClient,
     GeneratedResponse,
@@ -39,9 +42,13 @@ __all__ = [
     "KVTuple",
     "Embedder",
     "HashEmbedder",
+    "LocalModelEmbedder",
     "OpenAIEmbedder",
+    "GeminiEmbedder",
     "AnthropicModelClient",
     "OpenAIModelClient",
+    "GeminiModelClient",
+    "CodexModelClient",
     "ModelClient",
     "GeneratedResponse",
     "create_model_client",

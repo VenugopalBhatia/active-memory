@@ -29,7 +29,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .model_clients import ModelClient, create_model_client
+from .model_clients import DEFAULT_PROVIDER_MODELS, ModelClient, create_model_client
 
 # ── Frozen Conversation ───────────────────────────────────────────────
 
@@ -748,7 +748,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "openai", "ollama", "gemini", "codex"],
         default="anthropic",
         help="Model provider for live eval mode",
     )
@@ -760,7 +760,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--embedder",
-        choices=["auto", "hash", "openai"],
+        choices=["auto", "hash", "openai", "local", "gemini"],
         default="auto",
         help="Embedding provider for active-memory strategy",
     )
@@ -783,7 +783,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="claude-sonnet-4-20250514",
+        default=None,
         help="Model name for live eval mode",
     )
     parser.add_argument(
@@ -792,6 +792,8 @@ def main() -> None:
         help="Print machine-readable JSON summary after the text report",
     )
     args = parser.parse_args()
+    if args.model is None:
+        args.model = DEFAULT_PROVIDER_MODELS.get(args.provider, "gpt-4o-mini")
 
     from .embeddings import create_embedder
 

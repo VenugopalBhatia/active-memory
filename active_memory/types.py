@@ -52,6 +52,33 @@ class HashEmbedder:
         return out
 
 
+DEFAULT_LOCAL_MODEL = "all-MiniLM-L6-v2"
+
+
+class LocalModelEmbedder:
+    """Semantic embedder using a local sentence-transformer model.
+
+    Provides real semantic embeddings without requiring an API key.
+    Uses ``sentence-transformers`` under the hood (lazy-imported so
+    the dependency is only required when this embedder is selected).
+    """
+
+    def __init__(self, model_name: str = DEFAULT_LOCAL_MODEL) -> None:
+        from sentence_transformers import SentenceTransformer
+
+        self._model = SentenceTransformer(model_name)
+        self._dim = self._model.get_sentence_embedding_dimension()
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def embed(self, texts: list[str]) -> list[Embedding]:
+        # encode returns an ndarray of shape (len(texts), dim)
+        embeddings = self._model.encode(texts, normalize_embeddings=True)
+        return [np.asarray(vec, dtype=np.float32) for vec in embeddings]
+
+
 # -- KV Tuple ---------------------------------------------------------------
 
 @dataclass

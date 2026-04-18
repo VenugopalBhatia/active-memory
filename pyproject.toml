@@ -34,6 +34,12 @@ anthropic = [
 openai = [
   "openai>=1.30.0",
 ]
+gemini = [
+  "google-genai>=1.0.0",
+]
+local = [
+  "sentence-transformers>=3.0.0",
+]
 dev = [
   "anthropic>=0.34.0",
   "pytest>=8.0",

@@ -44,7 +44,7 @@ import numpy as np
 from .assembler import AssemblerConfig, ContextAssembler
 from .btree import BTreeConfig, SemanticBTree
 from .embeddings import create_embedder
-from .model_clients import ModelClient, create_model_client
+from .model_clients import DEFAULT_PROVIDER_MODELS, ModelClient, create_model_client
 from .scoring import Scorer, ScoringConfig
 from .types import Embedder, Embedding, estimate_tokens
 
@@ -726,13 +726,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "openai", "ollama", "gemini", "codex"],
         default="anthropic",
         help="Model provider for live benchmark runs",
     )
     parser.add_argument(
         "--model",
-        default="claude-sonnet-4-20250514",
+        default=None,
         help="Model to use for probes",
     )
     parser.add_argument(
@@ -749,7 +749,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--embedder",
-        choices=["auto", "hash", "openai"],
+        choices=["auto", "hash", "openai", "local", "gemini"],
         default="auto",
     )
     parser.add_argument(
@@ -797,6 +797,8 @@ def main() -> None:
         help="Embedding model when using OpenAI embeddings",
     )
     args = parser.parse_args()
+    if args.model is None:
+        args.model = DEFAULT_PROVIDER_MODELS.get(args.provider, "gpt-4o-mini")
 
     client = create_model_client(args.provider)
 
