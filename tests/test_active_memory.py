@@ -632,6 +632,55 @@ class TestContextManagerAndProxyBehavior(unittest.TestCase):
             manager.process_messages(next_turn)
             self.assertEqual(manager.tree.size, tree_after_stream + 1)
 
+    def test_context_manager_ingests_openai_response_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ContextManager(
+                ProxyConfig(
+                    token_budget=1_000,
+                    embedder_provider="hash",
+                    state_dir=tmp,
+                )
+            )
+            manager.process_messages([{"role": "user", "content": "Initial request " * 6}])
+            tree_after_user = manager.tree.size
+
+            manager.ingest_openai_response({
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "OpenAI decision " * 4},
+                        ],
+                    }
+                ]
+            })
+
+            self.assertGreater(manager.tree.size, tree_after_user)
+
+    def test_context_manager_ingests_gemini_response_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ContextManager(
+                ProxyConfig(
+                    token_budget=1_000,
+                    embedder_provider="hash",
+                    state_dir=tmp,
+                )
+            )
+            manager.process_messages([{"role": "user", "content": "Initial request " * 6}])
+            tree_after_user = manager.tree.size
+
+            manager.ingest_gemini_response({
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "Gemini answer " * 4}],
+                        }
+                    }
+                ]
+            })
+
+            self.assertGreater(manager.tree.size, tree_after_user)
+
     def test_assembled_prompt_never_exceeds_total_budget_with_wrappers(self) -> None:
         """Regression: previously, ``assemble`` sized the managed budget
         without reserving room for the SYSTEM hint / ack / recap wrapper
@@ -800,6 +849,117 @@ class TestContextManagerAndProxyBehavior(unittest.TestCase):
 
             self.assertFalse(errors)
             self.assertGreater(manager.tree.size, 0)
+
+    def test_proxy_handler_matches_responses_route_with_query_string(self) -> None:
+        handler = ProxyHandler.__new__(ProxyHandler)
+        handler.path = "/v1/responses?foo=1"
+        handler.headers = {"Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+
+        with patch.object(handler, "_handle_openai_responses") as handle_responses, patch.object(
+            handler, "_handle_config_update"
+        ) as handle_config_update, patch.object(handler, "_proxy_passthrough") as proxy_passthrough:
+            handler.do_POST()
+
+        handle_responses.assert_called_once_with(b"{}")
+        handle_config_update.assert_not_called()
+        proxy_passthrough.assert_not_called()
+
+    def test_proxy_handler_matches_gemini_generate_content_route(self) -> None:
+        handler = ProxyHandler.__new__(ProxyHandler)
+        handler.path = "/v1beta/models/gemini-2.5-flash:generateContent"
+        handler.headers = {"Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+
+        with patch.object(handler, "_handle_gemini_generate_content") as handle_gemini, patch.object(
+            handler, "_handle_config_update"
+        ) as handle_config_update, patch.object(handler, "_proxy_passthrough") as proxy_passthrough:
+            handler.do_POST()
+
+        handle_gemini.assert_called_once_with(b"{}")
+        handle_config_update.assert_not_called()
+        proxy_passthrough.assert_not_called()
+
+    def test_openai_responses_handler_rewrites_input_with_managed_messages(self) -> None:
+        class _RecordingContextManager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[dict], str | None]] = []
+
+            def process_messages(self, messages, system=None):
+                self.calls.append((messages, system))
+                return [{"role": "user", "content": "managed question"}]
+
+        handler = ProxyHandler.__new__(ProxyHandler)
+        handler.path = "/v1/responses"
+        handler.headers = {}
+        handler.context_manager = _RecordingContextManager()
+        handler.proxy_config = type("Cfg", (), {"verbose": False})()
+
+        captured: dict[str, object] = {}
+
+        def _capture(body, is_stream, *, response_family):
+            captured["body"] = body
+            captured["is_stream"] = is_stream
+            captured["family"] = response_family
+
+        with patch.object(handler, "_proxy_to_upstream", side_effect=_capture):
+            handler._handle_openai_responses(json.dumps({
+                "instructions": "System rule",
+                "input": [
+                    {"type": "message", "role": "user", "content": "Original question"},
+                ],
+            }).encode("utf-8"))
+
+        self.assertEqual(
+            handler.context_manager.calls,
+            [([{"role": "user", "content": "Original question"}], "System rule")],
+        )
+        payload = json.loads(captured["body"])
+        self.assertEqual(payload["instructions"], "System rule")
+        self.assertEqual(payload["input"][0]["role"], "user")
+        self.assertEqual(payload["input"][0]["content"], "managed question")
+        self.assertEqual(captured["family"], "openai")
+        self.assertFalse(captured["is_stream"])
+
+    def test_gemini_generate_content_handler_rewrites_contents(self) -> None:
+        class _RecordingContextManager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[dict], str | None]] = []
+
+            def process_messages(self, messages, system=None):
+                self.calls.append((messages, system))
+                return [{"role": "user", "content": "managed prompt"}]
+
+        handler = ProxyHandler.__new__(ProxyHandler)
+        handler.path = "/v1beta/models/gemini-2.5-flash:generateContent"
+        handler.headers = {}
+        handler.context_manager = _RecordingContextManager()
+        handler.proxy_config = type("Cfg", (), {"verbose": False})()
+
+        captured: dict[str, object] = {}
+
+        def _capture(body, is_stream, *, response_family):
+            captured["body"] = body
+            captured["is_stream"] = is_stream
+            captured["family"] = response_family
+
+        with patch.object(handler, "_proxy_to_upstream", side_effect=_capture):
+            handler._handle_gemini_generate_content(json.dumps({
+                "contents": [
+                    {"role": "user", "parts": [{"text": "Original prompt"}]},
+                ],
+                "config": {"system_instruction": "System note"},
+            }).encode("utf-8"))
+
+        self.assertEqual(
+            handler.context_manager.calls,
+            [([{"role": "user", "content": "Original prompt"}], "System note")],
+        )
+        payload = json.loads(captured["body"])
+        self.assertEqual(payload["contents"][0]["parts"][0]["text"], "managed prompt")
+        self.assertEqual(payload["config"]["system_instruction"], "System note")
+        self.assertEqual(captured["family"], "gemini")
+        self.assertFalse(captured["is_stream"])
 
 
 class TestAssemblerAndGroundingBehavior(unittest.TestCase):

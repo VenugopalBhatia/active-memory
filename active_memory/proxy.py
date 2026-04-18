@@ -1028,6 +1028,17 @@ class ContextManager:
         self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
         self._save_state()
 
+    def _index_assistant_text(self, text: str) -> None:
+        """Index a plain-text assistant response and store its fingerprint."""
+        assistant_text = text.strip()
+        if not assistant_text:
+            return
+
+        assistant_msg = {"role": "assistant", "content": assistant_text}
+        self._batch_insert_segments(self._segment_message("assistant", assistant_text))
+        self._message_fingerprints.append(self._fingerprint_message(assistant_msg))
+        self._save_state()
+
     def ingest_assistant_response(self, response_data: dict[str, Any]) -> None:
         """Index a completed non-streaming assistant response immediately."""
         content_blocks = response_data.get("content")
@@ -1035,6 +1046,92 @@ class ContextManager:
             return
         with self._lock:
             self._index_assistant_blocks(content_blocks)
+
+    def ingest_openai_response(self, response_data: dict[str, Any]) -> None:
+        """Index a non-streaming OpenAI Responses API assistant reply."""
+        output = response_data.get("output", [])
+        text_parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for part in item.get("content", []):
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type in {"output_text", "text"}:
+                    text_parts.append(str(part.get("text", "")))
+        self._index_assistant_text("\n".join(part for part in text_parts if part))
+
+    def ingest_openai_streaming_response(self, raw_sse: str) -> None:
+        """Index an OpenAI Responses API SSE stream best-effort."""
+        text_parts: list[str] = []
+        for line in raw_sse.splitlines():
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = str(event.get("type", ""))
+            if event_type.endswith(".delta"):
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    text_parts.append(delta)
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "message":
+                for part in item.get("content", []):
+                    if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
+                        text_parts.append(str(part.get("text", "")))
+        self._index_assistant_text("".join(text_parts))
+
+    def ingest_gemini_response(self, response_data: dict[str, Any]) -> None:
+        """Index a non-streaming Gemini assistant reply."""
+        text_parts: list[str] = []
+        for candidate in response_data.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content", {})
+            if not isinstance(content, dict):
+                continue
+            for part in content.get("parts", []):
+                if isinstance(part, dict) and "text" in part:
+                    text_parts.append(str(part.get("text", "")))
+        self._index_assistant_text("\n".join(part for part in text_parts if part))
+
+    def ingest_gemini_streaming_response(self, raw_payload: str) -> None:
+        """Index a Gemini streaming response best-effort.
+
+        Gemini streams are commonly delivered as JSON objects separated by
+        newlines rather than Anthropic-style SSE frames. We scan each line for
+        candidate text parts and concatenate them.
+        """
+        text_parts: list[str] = []
+        for line in raw_payload.splitlines():
+            data_str = line.strip()
+            if not data_str:
+                continue
+            if data_str.startswith("data: "):
+                data_str = data_str[6:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                payload = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            for candidate in payload.get("candidates", []):
+                if not isinstance(candidate, dict):
+                    continue
+                content = candidate.get("content", {})
+                if not isinstance(content, dict):
+                    continue
+                for part in content.get("parts", []):
+                    if isinstance(part, dict) and "text" in part:
+                        text_parts.append(str(part.get("text", "")))
+        self._index_assistant_text("".join(text_parts))
 
     def ingest_streaming_response(self, raw_sse: str) -> None:
         """Parse an SSE stream and index the assistant response.
@@ -1241,6 +1338,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """Return the URL path without query/fragment for route matching."""
         return urlsplit(self.path).path
 
+    @staticmethod
+    def _response_family_for_route(route: str) -> str:
+        """Infer provider family from request path for header/ingestion handling."""
+        if route == "/v1/messages":
+            return "anthropic"
+        if route in {"/v1/responses", "/v1/chat/completions"}:
+            return "openai" if route == "/v1/responses" else "openai_chat"
+        if route.endswith(":generateContent") or route.endswith(":streamGenerateContent"):
+            return "gemini"
+        return "anthropic"
+
     def do_GET(self):
         """Handle GET requests (health, stats, debug, config)."""
         route = self._request_path()
@@ -1290,6 +1398,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_config_update(body)
         elif route == "/v1/messages":
             self._handle_messages(body)
+        elif route == "/v1/responses":
+            self._handle_openai_responses(body)
+        elif route == "/v1/chat/completions":
+            self._handle_openai_chat_completions(body)
+        elif route.endswith(":generateContent") or route.endswith(":streamGenerateContent"):
+            self._handle_gemini_generate_content(body)
         else:
             # Pass through non-messages endpoints unchanged
             self._proxy_passthrough(body)
@@ -1405,46 +1519,284 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # -- Forward to upstream Anthropic API --
         upstream_body = json.dumps(request_data).encode("utf-8")
-        self._proxy_to_upstream(upstream_body, request_data.get("stream", False))
+        self._proxy_to_upstream(
+            upstream_body,
+            request_data.get("stream", False),
+            response_family="anthropic",
+        )
 
-    def _build_upstream_headers(self) -> dict[str, str]:
-        """Build headers for the upstream request.
+    @staticmethod
+    def _openai_input_text(content: Any) -> str:
+        """Extract text from OpenAI Responses input content."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type in {"input_text", "output_text", "text"}:
+                        parts.append(str(item.get("text", "")))
+            return "\n".join(part for part in parts if part)
+        return str(content or "")
 
-        Forwards auth headers from the incoming request (x-api-key or
-        Authorization) so the proxy works with both API keys and OAuth
-        login sessions. Falls back to the configured API key if the
-        client didn't send auth headers.
-        """
+    @staticmethod
+    def _gemini_parts_text(parts: Any) -> str:
+        """Extract text from Gemini content parts."""
+        if isinstance(parts, str):
+            return parts
+        if not isinstance(parts, list):
+            return ""
+        text_parts: list[str] = []
+        for part in parts:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and "text" in part:
+                text_parts.append(str(part.get("text", "")))
+        return "\n".join(part for part in text_parts if part)
+
+    def _handle_openai_responses(self, body: bytes):
+        """Intercept OpenAI/Codex Responses API requests when stateless input is provided."""
+        try:
+            request_data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return
+
+        if request_data.get("previous_response_id"):
+            self.context_manager._last_debug = {
+                "action": "passthrough",
+                "reason": "openai_previous_response_id_not_rewritable",
+            }
+            self._proxy_to_upstream(body, False, response_family="openai")
+            return
+
+        raw_input = request_data.get("input", [])
+        system_parts: list[str] = []
+        passthrough_items: list[Any] = []
+        original_messages: list[dict[str, str]] = []
+
+        if isinstance(raw_input, str):
+            original_messages = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            for item in raw_input:
+                if not isinstance(item, dict):
+                    passthrough_items.append(item)
+                    continue
+                role = str(item.get("role", "user"))
+                text = self._openai_input_text(item.get("content", ""))
+                if role in {"system", "developer"}:
+                    if text:
+                        system_parts.append(text)
+                    continue
+                if role in {"user", "assistant"} and text:
+                    original_messages.append({"role": role, "content": text})
+                else:
+                    passthrough_items.append(item)
+
+        instructions = request_data.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            system_parts.insert(0, instructions)
+        system = "\n\n".join(part for part in system_parts if part).strip() or None
+
+        optimised_messages = self.context_manager.process_messages(
+            original_messages, system
+        )
+
+        request_data["input"] = [
+            {
+                "type": "message",
+                "role": str(msg.get("role", "user")),
+                "content": str(msg.get("content", "")),
+            }
+            for msg in optimised_messages
+        ] + passthrough_items
+        if system:
+            request_data["instructions"] = system
+
+        upstream_body = json.dumps(request_data).encode("utf-8")
+        self._proxy_to_upstream(
+            upstream_body,
+            bool(request_data.get("stream")),
+            response_family="openai",
+        )
+
+    def _handle_openai_chat_completions(self, body: bytes):
+        """Intercept OpenAI chat completions using the same normalized message flow."""
+        try:
+            request_data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return
+
+        system_parts: list[str] = []
+        passthrough_messages: list[Any] = []
+        original_messages: list[dict[str, str]] = []
+
+        for item in request_data.get("messages", []):
+            if not isinstance(item, dict):
+                passthrough_messages.append(item)
+                continue
+            role = str(item.get("role", "user"))
+            text = self._openai_input_text(item.get("content", ""))
+            if role in {"system", "developer"}:
+                if text:
+                    system_parts.append(text)
+                continue
+            if role in {"user", "assistant"} and text:
+                original_messages.append({"role": role, "content": text})
+            else:
+                passthrough_messages.append(item)
+
+        system = "\n\n".join(part for part in system_parts if part).strip() or None
+        optimised_messages = self.context_manager.process_messages(
+            original_messages, system
+        )
+        request_data["messages"] = (
+            ([{"role": "system", "content": system}] if system else [])
+            + [
+                {
+                    "role": str(msg.get("role", "user")),
+                    "content": str(msg.get("content", "")),
+                }
+                for msg in optimised_messages
+            ]
+            + passthrough_messages
+        )
+
+        upstream_body = json.dumps(request_data).encode("utf-8")
+        self._proxy_to_upstream(
+            upstream_body,
+            bool(request_data.get("stream")),
+            response_family="openai_chat",
+        )
+
+    def _handle_gemini_generate_content(self, body: bytes):
+        """Intercept Gemini generateContent requests."""
+        try:
+            request_data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return
+
+        config = request_data.get("config")
+        config_dict = dict(config) if isinstance(config, dict) else {}
+
+        system_parts: list[str] = []
+        system_instruction = config_dict.get("system_instruction")
+        if isinstance(system_instruction, str) and system_instruction.strip():
+            system_parts.append(system_instruction)
+        elif isinstance(system_instruction, dict):
+            text = self._gemini_parts_text(system_instruction.get("parts", []))
+            if text:
+                system_parts.append(text)
+
+        raw_contents = request_data.get("contents", [])
+        original_messages: list[dict[str, str]] = []
+        if isinstance(raw_contents, str):
+            original_messages = [{"role": "user", "content": raw_contents}]
+        elif isinstance(raw_contents, dict):
+            raw_contents = [raw_contents]
+
+        if isinstance(raw_contents, list):
+            for content in raw_contents:
+                if not isinstance(content, dict):
+                    continue
+                role = str(content.get("role", "user"))
+                text = self._gemini_parts_text(content.get("parts", []))
+                if not text:
+                    continue
+                original_messages.append({
+                    "role": "assistant" if role == "model" else "user",
+                    "content": text,
+                })
+
+        system = "\n\n".join(part for part in system_parts if part).strip() or None
+        optimised_messages = self.context_manager.process_messages(
+            original_messages, system
+        )
+
+        request_data["contents"] = [
+            {
+                "role": "model" if msg.get("role") == "assistant" else "user",
+                "parts": [{"text": str(msg.get("content", ""))}],
+            }
+            for msg in optimised_messages
+        ]
+        if system:
+            config_dict["system_instruction"] = system
+        if config_dict:
+            request_data["config"] = config_dict
+
+        upstream_body = json.dumps(request_data).encode("utf-8")
+        route = self._request_path()
+        self._proxy_to_upstream(
+            upstream_body,
+            route.endswith(":streamGenerateContent"),
+            response_family="gemini",
+        )
+
+    def _build_upstream_headers(self, response_family: str) -> dict[str, str]:
+        """Build headers for the upstream request based on provider family."""
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "accept": self.headers.get("accept", "application/json"),
-            "anthropic-version": self.headers.get(
-                "anthropic-version", "2023-06-01"
-            ),
         }
 
-        # Forward auth: prefer what the client sent, fall back to config
         client_api_key = self.headers.get("x-api-key")
         client_auth = self.headers.get("authorization")
-        if client_api_key:
-            headers["x-api-key"] = client_api_key
-        elif client_auth:
-            headers["authorization"] = client_auth
-        elif self.proxy_config.api_key:
-            headers["x-api-key"] = self.proxy_config.api_key
+        client_google_key = self.headers.get("x-goog-api-key")
 
-        # Copy other relevant Anthropic headers
-        for key in ("anthropic-beta", "anthropic-dangerous-direct-browser-access"):
-            val = self.headers.get(key)
-            if val:
-                headers[key] = val
+        if response_family == "anthropic":
+            headers["anthropic-version"] = self.headers.get(
+                "anthropic-version", "2023-06-01"
+            )
+            if client_api_key:
+                headers["x-api-key"] = client_api_key
+            elif client_auth:
+                headers["authorization"] = client_auth
+            elif self.proxy_config.api_key:
+                headers["x-api-key"] = self.proxy_config.api_key
+            for key in ("anthropic-beta", "anthropic-dangerous-direct-browser-access"):
+                val = self.headers.get(key)
+                if val:
+                    headers[key] = val
+            return headers
+
+        if response_family in {"openai", "openai_chat"}:
+            if client_auth:
+                headers["authorization"] = client_auth
+            elif client_api_key:
+                headers["authorization"] = f"Bearer {client_api_key}"
+            else:
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if api_key:
+                    headers["authorization"] = f"Bearer {api_key}"
+            for key in ("openai-beta",):
+                val = self.headers.get(key)
+                if val:
+                    headers[key] = val
+            return headers
+
+        if response_family == "gemini":
+            if client_google_key:
+                headers["x-goog-api-key"] = client_google_key
+            elif client_auth:
+                headers["authorization"] = client_auth
+            else:
+                api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if api_key:
+                    headers["x-goog-api-key"] = api_key
+            return headers
 
         return headers
 
-    def _proxy_to_upstream(self, body: bytes, is_stream: bool):
-        """Forward the request to the real Anthropic API."""
+    def _proxy_to_upstream(self, body: bytes, is_stream: bool, *, response_family: str):
+        """Forward the request to the configured upstream API."""
         url = f"{self.proxy_config.upstream_url}{self.path}"
-        headers = self._build_upstream_headers()
+        headers = self._build_upstream_headers(response_family)
 
         req = Request(url, data=body, headers=headers, method="POST")
 
@@ -1480,29 +1832,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         stream_buf.extend(chunk)
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                    # Parse accumulated SSE stream and ingest assistant text
-                    try:
-                        self.context_manager.ingest_streaming_response(
-                            stream_buf.decode("utf-8", errors="replace")
-                        )
-                    except Exception:
-                        if self.proxy_config.verbose:
-                            print(
-                                "  [proxy] Skipped assistant ingestion from stream",
-                                file=sys.stderr,
-                            )
+                    self._ingest_stream_response(
+                        stream_buf.decode("utf-8", errors="replace"),
+                        response_family,
+                    )
                 else:
                     response_body = response.read()
-                    try:
-                        self.context_manager.ingest_assistant_response(
-                            json.loads(response_body)
-                        )
-                    except json.JSONDecodeError:
-                        if self.proxy_config.verbose:
-                            print(
-                                "  [proxy] Skipped assistant ingestion: upstream body was not valid JSON",
-                                file=sys.stderr,
-                            )
+                    self._ingest_json_response(response_body, response_family)
                     self.wfile.write(response_body)
 
         except HTTPError as e:
@@ -1526,10 +1862,60 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "message": f"Unexpected proxy error: {e}",
             })
 
+    def _ingest_json_response(self, response_body: bytes, response_family: str) -> None:
+        """Index a completed non-streaming assistant response when supported."""
+        try:
+            payload = json.loads(response_body)
+        except json.JSONDecodeError:
+            if self.proxy_config.verbose:
+                print(
+                    "  [proxy] Skipped assistant ingestion: upstream body was not valid JSON",
+                    file=sys.stderr,
+                )
+            return
+
+        try:
+            if response_family == "anthropic":
+                self.context_manager.ingest_assistant_response(payload)
+            elif response_family == "openai":
+                self.context_manager.ingest_openai_response(payload)
+            elif response_family == "openai_chat":
+                choice = payload.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                self.context_manager._index_assistant_text(
+                    self._openai_input_text(message.get("content", ""))
+                )
+            elif response_family == "gemini":
+                self.context_manager.ingest_gemini_response(payload)
+        except Exception:
+            if self.proxy_config.verbose:
+                print(
+                    "  [proxy] Skipped assistant ingestion from JSON response",
+                    file=sys.stderr,
+                )
+
+    def _ingest_stream_response(self, raw_payload: str, response_family: str) -> None:
+        """Index a completed streaming assistant response when supported."""
+        try:
+            if response_family == "anthropic":
+                self.context_manager.ingest_streaming_response(raw_payload)
+            elif response_family == "openai":
+                self.context_manager.ingest_openai_streaming_response(raw_payload)
+            elif response_family == "gemini":
+                self.context_manager.ingest_gemini_streaming_response(raw_payload)
+        except Exception:
+            if self.proxy_config.verbose:
+                print(
+                    "  [proxy] Skipped assistant ingestion from stream",
+                    file=sys.stderr,
+                )
+
     def _proxy_passthrough(self, body: bytes):
         """Forward non-messages requests unchanged."""
         url = f"{self.proxy_config.upstream_url}{self.path}"
-        headers = self._build_upstream_headers()
+        headers = self._build_upstream_headers(
+            self._response_family_for_route(self._request_path())
+        )
         req = Request(url, data=body, headers=headers, method="POST")
 
         try:
