@@ -71,7 +71,7 @@ class Scorer:
         if query_emb is not None and t.key_emb is not None:
             relevance = max(0.0, cosine_sim(query_emb, t.key_emb))
         else:
-            relevance = 0.5  # neutral when no query
+            relevance = 0.0
 
         # -- structural affinity --
         affinity = self._compute_affinity(t)

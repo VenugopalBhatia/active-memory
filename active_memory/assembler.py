@@ -168,9 +168,9 @@ class ContextAssembler:
         anchored_blocks: list[ManagedBlock] = []
         anchored_ids: set[str] = set()
         included_keys: set[str] = set()
+        all_tuples = self.tree.all_tuples() if query_emb is not None else []
 
         if query_emb is not None:
-            all_tuples = self.tree.all_tuples()
             for t in all_tuples:
                 if t.key_emb is None:
                     continue
@@ -223,9 +223,9 @@ class ContextAssembler:
         dep_count = 0
         if self.cfg.dependency_pull:
             dep_budget = int(managed_budget * self.cfg.dependency_budget_fraction)
-            dep_ids = self._collect_dependency_ids(scored_ids)
+            dep_ids = self._collect_dependency_ids(scored_ids, tuples=all_tuples)
 
-            for t in self.tree.all_tuples():
+            for t in all_tuples:
                 if t.id in dep_ids and t.id not in scored_ids:
                     effective_cost = t.token_cost + _WRAPPER_PER_BLOCK_OVERHEAD
                     if (
@@ -266,11 +266,16 @@ class ContextAssembler:
             system_tokens=system_tokens,
         )
 
-    def _collect_dependency_ids(self, included_ids: set[str]) -> set[str]:
+    def _collect_dependency_ids(
+        self,
+        included_ids: set[str],
+        tuples: list[KVTuple] | None = None,
+    ) -> set[str]:
         """Collect IDs of tuples that are structurally related to
         the included set (one hop in the call graph)."""
         dep_ids: set[str] = set()
-        for t in self.tree.all_tuples():
+        source = tuples if tuples is not None else self.tree.all_tuples()
+        for t in source:
             if t.id in included_ids:
                 dep_ids.update(t.references)
                 dep_ids.update(t.referenced_by)

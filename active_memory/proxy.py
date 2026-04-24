@@ -43,14 +43,14 @@ import json
 import os
 import re
 import sys
+import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-import threading
 
 from .types import KVTuple, estimate_tokens
 
@@ -143,6 +143,7 @@ class ContextManager:
         self._usage_history: list[dict[str, Any]] = []
         self._operational_facts: list[dict[str, Any]] = []
         self._last_debug: dict = {}  # last assembly decision for /debug
+        self._lock = threading.Lock()
 
         # Load previous state if exists
         self._load_state()
@@ -308,253 +309,253 @@ class ContextManager:
         that Claude Code is trying to send, ingests any new messages
         into the B-tree, then returns an optimised message list.
         """
-        # -- 1. Ingest new messages --
-        pending_segments: list[tuple[str, str]] = []
-        incoming_fingerprints = [self._fingerprint_message(msg) for msg in messages]
-        prefix_len = 0
-        max_prefix = min(len(self._message_fingerprints), len(incoming_fingerprints))
-        while (
-            prefix_len < max_prefix
-            and self._message_fingerprints[prefix_len] == incoming_fingerprints[prefix_len]
-        ):
-            prefix_len += 1
+        with self._lock:
+            # -- 1. Ingest new messages --
+            pending_segments: list[tuple[str, str]] = []
+            incoming_fingerprints = [self._fingerprint_message(msg) for msg in messages]
+            prefix_len = 0
+            max_prefix = min(len(self._message_fingerprints), len(incoming_fingerprints))
+            while (
+                prefix_len < max_prefix
+                and self._message_fingerprints[prefix_len] == incoming_fingerprints[prefix_len]
+            ):
+                prefix_len += 1
 
-        for msg in messages[prefix_len:]:
-            content = self._extract_text(msg)
-            role = msg.get("role", "user")
-            pending_segments.extend(self._segment_message(role, content))
+            for msg in messages[prefix_len:]:
+                content = self._extract_text(msg)
+                role = msg.get("role", "user")
+                pending_segments.extend(self._segment_message(role, content))
 
-        self._batch_insert_segments(pending_segments)
-        self._update_operational_facts(messages[prefix_len:])
-        self._message_fingerprints = incoming_fingerprints
+            self._batch_insert_segments(pending_segments)
+            self._update_operational_facts(messages[prefix_len:])
+            self._message_fingerprints = incoming_fingerprints
 
-        if prefix_len < len(incoming_fingerprints):
-            self._turn_count += 1
-        if self.cfg.verbose:
-            print(
-                f"  [proxy] registered turn {self._turn_count} "
-                f"(messages={len(messages)}, new_segments={len(pending_segments)})",
-                file=sys.stderr,
-            )
-
-        # -- 2. Bypass if conversation is small --
-        # No point managing context if it already fits comfortably.
-        # Only activate when raw conversation exceeds 50% of budget.
-        # The system prompt is forwarded as a top-level field but still
-        # consumes context-window budget upstream, so include it here
-        # too — otherwise a large system prompt can push the request
-        # over budget while the proxy stays in passthrough mode.
-        system_tokens = estimate_tokens(self._system_text(system))
-        raw_tokens = system_tokens + sum(
-            estimate_tokens(self._extract_text(m)) for m in messages
-        )
-        activation_threshold = self.cfg.token_budget // 2
-
-        if raw_tokens < activation_threshold:
-            self._last_debug = {
-                "turn": self._turn_count,
-                "action": "passthrough",
-                "original_tokens": raw_tokens,
-                "activation_threshold": activation_threshold,
-                "tree_size": self.tree.size,
-            }
-            self._save_state()
+            if prefix_len < len(incoming_fingerprints):
+                self._turn_count += 1
             if self.cfg.verbose:
                 print(
-                    f"  [proxy] turn {self._turn_count}: "
-                    f"passthrough ({raw_tokens:,} < {activation_threshold:,} threshold) | "
-                    f"tree: {self.tree.size} tuples (indexing only)",
+                    f"  [proxy] registered turn {self._turn_count} "
+                    f"(messages={len(messages)}, new_segments={len(pending_segments)})",
                     file=sys.stderr,
                 )
-            self._record_usage(
-                action="passthrough",
-                raw_tokens=raw_tokens,
-                sent_tokens=raw_tokens,
+
+            # -- 2. Bypass if conversation is small --
+            # No point managing context if it already fits comfortably.
+            # Only activate when raw conversation exceeds 50% of budget.
+            # The system prompt is forwarded as a top-level field but still
+            # consumes context-window budget upstream, so include it here
+            # too — otherwise a large system prompt can push the request
+            # over budget while the proxy stays in passthrough mode.
+            system_tokens = estimate_tokens(self._system_text(system))
+            raw_tokens = system_tokens + sum(
+                estimate_tokens(self._extract_text(m)) for m in messages
             )
-            return messages  # pass through unchanged, but tree is still building
+            activation_threshold = self.cfg.token_budget // 2
 
-        # -- 3. Check if we should do a FULL CONTEXT RESET --
-        # When the raw conversation gets too large, instead of trying to
-        # trim it, we throw it away entirely and rebuild from the B-tree.
-        # From the model's perspective, it's a brand new conversation with
-        # a curated briefing. Context rot literally cannot survive this.
-        reset_threshold_tokens = int(self.cfg.token_budget * self.cfg.reset_threshold)
-        reset_growth_tokens = int(self.cfg.token_budget * self.cfg.reset_hysteresis_ratio)
-        reset_growth_floor = max(reset_threshold_tokens, self._last_reset_raw_tokens + reset_growth_tokens)
-        reset_cooldown_active = (
-            self._reset_count > 0
-            and (self._turn_count - self._last_reset_turn) <= self.cfg.reset_cooldown_turns
-        )
-        reset_suppressed_this_turn = False
-
-        if raw_tokens > reset_threshold_tokens:
-            if reset_cooldown_active or raw_tokens < reset_growth_floor:
-                reset_suppressed_this_turn = True
+            if raw_tokens < activation_threshold:
                 self._last_debug = {
                     "turn": self._turn_count,
-                    "action": "managed_reset_suppressed",
+                    "action": "passthrough",
                     "original_tokens": raw_tokens,
-                    "reset_threshold": reset_threshold_tokens,
-                    "reset_growth_floor": reset_growth_floor,
-                    "reset_cooldown_turns": self.cfg.reset_cooldown_turns,
-                    "turns_since_reset": self._turn_count - self._last_reset_turn,
+                    "activation_threshold": activation_threshold,
                     "tree_size": self.tree.size,
                 }
+                self._save_state()
                 if self.cfg.verbose:
-                    reason = (
-                        "cooldown"
-                        if reset_cooldown_active
-                        else "insufficient growth"
-                    )
                     print(
-                        f"  [proxy] turn {self._turn_count}: reset suppressed "
-                        f"({reason}; raw={raw_tokens:,}, floor={reset_growth_floor:,})",
+                        f"  [proxy] turn {self._turn_count}: "
+                        f"passthrough ({raw_tokens:,} < {activation_threshold:,} threshold) | "
+                        f"tree: {self.tree.size} tuples (indexing only)",
                         file=sys.stderr,
                     )
+                self._record_usage(
+                    action="passthrough",
+                    raw_tokens=raw_tokens,
+                    sent_tokens=raw_tokens,
+                )
+                return messages  # pass through unchanged, but tree is still building
+
+            # -- 3. Check if we should do a FULL CONTEXT RESET --
+            # When the raw conversation gets too large, instead of trying to
+            # trim it, we throw it away entirely and rebuild from the B-tree.
+            # From the model's perspective, it's a brand new conversation with
+            # a curated briefing. Context rot literally cannot survive this.
+            reset_threshold_tokens = int(self.cfg.token_budget * self.cfg.reset_threshold)
+            reset_growth_tokens = int(self.cfg.token_budget * self.cfg.reset_hysteresis_ratio)
+            reset_growth_floor = max(reset_threshold_tokens, self._last_reset_raw_tokens + reset_growth_tokens)
+            reset_cooldown_active = (
+                self._reset_count > 0
+                and (self._turn_count - self._last_reset_turn) <= self.cfg.reset_cooldown_turns
+            )
+            reset_suppressed_this_turn = False
+
+            if raw_tokens > reset_threshold_tokens:
+                if reset_cooldown_active or raw_tokens < reset_growth_floor:
+                    reset_suppressed_this_turn = True
+                    self._last_debug = {
+                        "turn": self._turn_count,
+                        "action": "managed_reset_suppressed",
+                        "original_tokens": raw_tokens,
+                        "reset_threshold": reset_threshold_tokens,
+                        "reset_growth_floor": reset_growth_floor,
+                        "reset_cooldown_turns": self.cfg.reset_cooldown_turns,
+                        "turns_since_reset": self._turn_count - self._last_reset_turn,
+                        "tree_size": self.tree.size,
+                    }
+                    if self.cfg.verbose:
+                        reason = (
+                            "cooldown"
+                            if reset_cooldown_active
+                            else "insufficient growth"
+                        )
+                        print(
+                            f"  [proxy] turn {self._turn_count}: reset suppressed "
+                            f"({reason}; raw={raw_tokens:,}, floor={reset_growth_floor:,})",
+                            file=sys.stderr,
+                        )
+                else:
+                    return self._context_reset(messages, system)
+
+            # -- 4. Compute query embedding for maintenance + assembly --
+            last_user_msg = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    last_user_msg = self._extract_text(msg)
+                    break
+
+            query_emb = None
+            if last_user_msg:
+                query_emb = self.embedder.embed([last_user_msg])[0]
+
+            # -- 5. Periodic maintenance --
+            if self._turn_count % self.cfg.prune_interval == 0:
+                self.tree.prune(query_emb)
+            if self._turn_count % self.cfg.compress_interval == 0:
+                self.tree.compress_cold_subtrees(query_emb=query_emb)
+
+            # -- 6. Assemble optimised context --
+            if query_emb is not None and self.tree.size > 0:
+                assembled = self.assembler.assemble(messages, query_emb, system=system)
             else:
-                return self._context_reset(messages, system)
+                # Not enough context to manage — pass through
+                self._last_debug = {
+                    "turn": self._turn_count,
+                    "action": "passthrough",
+                    "original_tokens": raw_tokens,
+                    "reason": "empty_tree_or_no_user_message",
+                    "tree_size": self.tree.size,
+                }
+                self._record_usage(
+                    action="passthrough",
+                    raw_tokens=raw_tokens,
+                    sent_tokens=raw_tokens,
+                    reset_suppressed=reset_suppressed_this_turn,
+                )
+                self._save_state()
+                return messages
 
-        # -- 4. Periodic maintenance --
-        if self._turn_count % self.cfg.prune_interval == 0:
-            self.tree.prune()
-        if self._turn_count % self.cfg.compress_interval == 0:
-            self.tree.compress_cold_subtrees()
+            # -- 7. Build optimised message list --
+            optimised = self.assembler.to_messages(
+                system,
+                assembled,
+            )
+            operational_context = self._build_operational_context()
+            if operational_context:
+                operational_tokens = estimate_tokens(operational_context)
+                total_budget = self.assembler.cfg.total_budget
+                # Drop lowest-priority managed blocks until the operational
+                # context block fits.  We rebuild ``optimised`` after dropping
+                # so the prompt actually reflects the accounting — popping
+                # from ``assembled.managed_blocks`` alone does not remove the
+                # blocks from a previously-built ``optimised`` list.
+                dropped_any = False
+                while (
+                    assembled.managed_blocks
+                    and assembled.total_tokens + operational_tokens > total_budget
+                ):
+                    dropped = assembled.managed_blocks.pop()
+                    assembled.total_tokens -= dropped.token_cost
+                    assembled.budget_remaining += dropped.token_cost
+                    if dropped.source == "anchored":
+                        assembled.anchored_count = max(0, assembled.anchored_count - 1)
+                    elif dropped.source == "dependency":
+                        assembled.dependency_count = max(0, assembled.dependency_count - 1)
+                    dropped_any = True
+                assembled.tuples_included = len(assembled.managed_blocks)
 
-        # -- 3. Assemble optimised context --
-        # Get the latest user message for relevance scoring
-        last_user_msg = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                last_user_msg = self._extract_text(msg)
-                break
+                if dropped_any:
+                    # Rebuild the message list now that managed_blocks shrank.
+                    # to_messages is idempotent w.r.t. wrapper accounting.
+                    optimised = self.assembler.to_messages(system, assembled)
 
-        if last_user_msg and self.tree.size > 0:
-            query_emb = self.embedder.embed([last_user_msg])[0]
-            assembled = self.assembler.assemble(messages, query_emb, system=system)
-        else:
-            # Not enough context to manage — pass through
+                if assembled.total_tokens + operational_tokens <= total_budget:
+                    optimised.insert(0, {
+                        "role": "user",
+                        "content": operational_context,
+                    })
+                    assembled.total_tokens += operational_tokens
+                    assembled.budget_remaining -= operational_tokens
+
+            # -- 8. Capture debug info --
+            original_tokens = raw_tokens
+            selected = [
+                {
+                    "key": b.key,
+                    "score": round(b.score, 4),
+                    "tokens": b.token_cost,
+                    "source": b.source,
+                }
+                for b in sorted(
+                    assembled.managed_blocks,
+                    key=lambda b: b.score,
+                    reverse=True,
+                )
+            ]
             self._last_debug = {
                 "turn": self._turn_count,
-                "action": "passthrough",
-                "original_tokens": raw_tokens,
-                "reason": "empty_tree_or_no_user_message",
+                "action": "managed",
+                "original_tokens": original_tokens,
+                "assembled_tokens": assembled.total_tokens,
+                "savings": max(0, original_tokens - assembled.total_tokens),
+                "budget": self.assembler.cfg.total_budget,
+                "budget_remaining": assembled.budget_remaining,
                 "tree_size": self.tree.size,
+                "tree_depth": self.tree.depth(),
+                "tuples_considered": assembled.tuples_considered,
+                "tuples_included": assembled.tuples_included,
+                "anchored_count": assembled.anchored_count,
+                "dependency_count": assembled.dependency_count,
+                "selected_tuples": selected,
+                "query": last_user_msg[:200],
             }
-            self._record_usage(
-                action="passthrough",
-                raw_tokens=raw_tokens,
-                sent_tokens=raw_tokens,
-                reset_suppressed=reset_suppressed_this_turn,
-            )
+
             self._save_state()
-            return messages
 
-        # -- 4. Build optimised message list --
-        optimised = self.assembler.to_messages(
-            system,
-            assembled,
-        )
-        operational_context = self._build_operational_context()
-        if operational_context:
-            operational_tokens = estimate_tokens(operational_context)
-            total_budget = self.assembler.cfg.total_budget
-            # Drop lowest-priority managed blocks until the operational
-            # context block fits.  We rebuild ``optimised`` after dropping
-            # so the prompt actually reflects the accounting — popping
-            # from ``assembled.managed_blocks`` alone does not remove the
-            # blocks from a previously-built ``optimised`` list.
-            dropped_any = False
-            while (
-                assembled.managed_blocks
-                and assembled.total_tokens + operational_tokens > total_budget
-            ):
-                dropped = assembled.managed_blocks.pop()
-                assembled.total_tokens -= dropped.token_cost
-                assembled.budget_remaining += dropped.token_cost
-                if dropped.source == "anchored":
-                    assembled.anchored_count = max(0, assembled.anchored_count - 1)
-                elif dropped.source == "dependency":
-                    assembled.dependency_count = max(0, assembled.dependency_count - 1)
-                dropped_any = True
-            assembled.tuples_included = len(assembled.managed_blocks)
-
-            if dropped_any:
-                # Rebuild the message list now that managed_blocks shrank.
-                # to_messages is idempotent w.r.t. wrapper accounting.
-                optimised = self.assembler.to_messages(system, assembled)
-
-            if assembled.total_tokens + operational_tokens <= total_budget:
-                optimised.insert(0, {
-                    "role": "user",
-                    "content": operational_context,
-                })
-                assembled.total_tokens += operational_tokens
-                assembled.budget_remaining -= operational_tokens
-
-        # -- 5. Capture debug info --
-        original_tokens = system_tokens + sum(
-            estimate_tokens(self._extract_text(m)) for m in messages
-        )
-        selected = [
-            {
-                "key": b.key,
-                "score": round(b.score, 4),
-                "tokens": b.token_cost,
-                "source": b.source,
-            }
-            for b in sorted(
-                assembled.managed_blocks,
-                key=lambda b: b.score,
-                reverse=True,
-            )
-        ]
-        self._last_debug = {
-            "turn": self._turn_count,
-            "action": "managed",
-            "original_tokens": original_tokens,
-            "assembled_tokens": assembled.total_tokens,
-            "savings": max(0, original_tokens - assembled.total_tokens),
-            "budget": self.assembler.cfg.total_budget,
-            "budget_remaining": assembled.budget_remaining,
-            "tree_size": self.tree.size,
-            "tree_depth": self.tree.depth(),
-            "tuples_considered": assembled.tuples_considered,
-            "tuples_included": assembled.tuples_included,
-            "anchored_count": assembled.anchored_count,
-            "dependency_count": assembled.dependency_count,
-            "selected_tuples": selected,
-            "query": last_user_msg[:200],
-        }
-
-        # -- 6. Save state --
-        self._save_state()
-
-        if self.cfg.verbose:
-            savings = self._last_debug["savings"]
-            print(
-                f"  [proxy] turn {self._turn_count}: "
-                f"{original_tokens:,} → {assembled.total_tokens:,} tokens "
-                f"(-{savings:,}) | "
-                f"tree: {self.tree.size} tuples, depth {self.tree.depth()} | "
-                f"anchored: {assembled.anchored_count}, "
-                f"deps: {assembled.dependency_count}",
-                file=sys.stderr,
-            )
-            # Show top-5 selected tuples
-            for entry in selected[:5]:
+            if self.cfg.verbose:
+                savings = self._last_debug["savings"]
                 print(
-                    f"    {entry['score']:.3f}  [{entry['source']:<10}] "
-                    f"{entry['key'][:60]}  ({entry['tokens']} tok)",
+                    f"  [proxy] turn {self._turn_count}: "
+                    f"{original_tokens:,} → {assembled.total_tokens:,} tokens "
+                    f"(-{savings:,}) | "
+                    f"tree: {self.tree.size} tuples, depth {self.tree.depth()} | "
+                    f"anchored: {assembled.anchored_count}, "
+                    f"deps: {assembled.dependency_count}",
                     file=sys.stderr,
                 )
+                for entry in selected[:5]:
+                    print(
+                        f"    {entry['score']:.3f}  [{entry['source']:<10}] "
+                        f"{entry['key'][:60]}  ({entry['tokens']} tok)",
+                        file=sys.stderr,
+                    )
 
-        self._record_usage(
-            action=self._last_debug["action"],
-            raw_tokens=original_tokens,
-            sent_tokens=assembled.total_tokens,
-            reset_suppressed=reset_suppressed_this_turn,
-        )
-        return optimised
+            self._record_usage(
+                action=self._last_debug["action"],
+                raw_tokens=original_tokens,
+                sent_tokens=assembled.total_tokens,
+                reset_suppressed=reset_suppressed_this_turn,
+            )
+            return optimised
 
     def _context_reset(
         self,
@@ -588,11 +589,7 @@ class ContextManager:
         self._reset_count += 1
         self._last_reset_turn = self._turn_count
 
-        # -- 1. Aggressive maintenance before reset --
-        self.tree.prune()
-        self.tree.compress_cold_subtrees()
-
-        # -- 2. Build a topic-grouped briefing from the tree --
+        # -- 1. Build a topic-grouped briefing from the tree --
         last_user_msg = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
@@ -603,7 +600,11 @@ class ContextManager:
         if last_user_msg:
             query_emb = self.embedder.embed([last_user_msg])[0]
 
-        # Use the tree's cluster structure for topic grouping
+        # -- 2. Aggressive maintenance before reset --
+        self.tree.prune(query_emb)
+        self.tree.compress_cold_subtrees(query_emb=query_emb)
+
+        # -- 3. Use the tree's cluster structure for topic grouping --
         clusters = self.tree.tuples_by_cluster()
 
         # Score each cluster: average score of its tuples, and track the
@@ -654,7 +655,7 @@ class ContextManager:
                     f"[{topic_label}]\n" + "\n".join(section_lines)
                 )
 
-        # -- 3. Construct fresh message list --
+        # -- 4. Construct fresh message list --
         fresh_messages: list[dict] = []
         operational_context = self._build_operational_context()
         if operational_context:
@@ -684,12 +685,12 @@ class ContextManager:
                 ),
             })
 
-        # -- 4. Append the last N actual conversation turns --
+        # -- 5. Append the last N actual conversation turns --
         recency = self.cfg.reset_recency_turns * 2  # user + assistant
         recent_turns = messages[-recency:] if len(messages) > recency else messages
         fresh_messages.extend(recent_turns)
 
-        # -- 5. Capture debug info and log the reset --
+        # -- 6. Capture debug info and log the reset --
         system_tokens = estimate_tokens(self._system_text(system))
         original_tokens = system_tokens + sum(
             estimate_tokens(self._extract_text(m)) for m in messages
@@ -1032,7 +1033,8 @@ class ContextManager:
         content_blocks = response_data.get("content")
         if not isinstance(content_blocks, list):
             return
-        self._index_assistant_blocks(content_blocks)
+        with self._lock:
+            self._index_assistant_blocks(content_blocks)
 
     def ingest_streaming_response(self, raw_sse: str) -> None:
         """Parse an SSE stream and index the assistant response.
@@ -1044,50 +1046,50 @@ class ContextManager:
         Handles both ``text_delta`` (text blocks) and
         ``input_json_delta`` (tool_use input).
         """
-        content_blocks: list[dict] = []
-        current_block: dict | None = None
-        json_buf: list[str] = []
+        with self._lock:
+            content_blocks: list[dict] = []
+            current_block: dict | None = None
+            json_buf: list[str] = []
 
-        for line in raw_sse.splitlines():
-            if not line.startswith("data: "):
-                continue
-            data_str = line[6:]
-            if data_str.strip() == "[DONE]":
-                break
-            try:
-                event = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
+            for line in raw_sse.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
 
-            event_type = event.get("type", "")
-            if event_type == "content_block_start":
-                block = event.get("content_block")
-                if isinstance(block, dict):
-                    current_block = dict(block)
+                event_type = event.get("type", "")
+                if event_type == "content_block_start":
+                    block = event.get("content_block")
+                    if isinstance(block, dict):
+                        current_block = dict(block)
+                        json_buf = []
+                        content_blocks.append(current_block)
+                elif event_type == "content_block_delta" and current_block is not None:
+                    delta = event.get("delta", {})
+                    dtype = delta.get("type", "")
+                    if dtype == "text_delta":
+                        current_block["text"] = (
+                            current_block.get("text", "") + delta.get("text", "")
+                        )
+                    elif dtype == "input_json_delta":
+                        json_buf.append(delta.get("partial_json", ""))
+                elif event_type == "content_block_stop" and current_block is not None:
+                    if current_block.get("type") == "tool_use" and json_buf:
+                        try:
+                            current_block["input"] = json.loads("".join(json_buf))
+                        except json.JSONDecodeError:
+                            pass
+                    current_block = None
                     json_buf = []
-                    content_blocks.append(current_block)
-            elif event_type == "content_block_delta" and current_block is not None:
-                delta = event.get("delta", {})
-                dtype = delta.get("type", "")
-                if dtype == "text_delta":
-                    current_block["text"] = (
-                        current_block.get("text", "") + delta.get("text", "")
-                    )
-                elif dtype == "input_json_delta":
-                    json_buf.append(delta.get("partial_json", ""))
-            elif event_type == "content_block_stop" and current_block is not None:
-                if current_block.get("type") == "tool_use" and json_buf:
-                    try:
-                        current_block["input"] = json.loads("".join(json_buf))
-                    except json.JSONDecodeError:
-                        # Leave whatever input was on the start event
-                        pass
-                current_block = None
-                json_buf = []
 
-        if not content_blocks:
-            return
-        self._index_assistant_blocks(content_blocks)
+            if not content_blocks:
+                return
+            self._index_assistant_blocks(content_blocks)
 
     def _save_state(self) -> None:
         state_dir = Path(self.cfg.state_dir)
@@ -1732,7 +1734,7 @@ Example:
     ProxyHandler.context_manager = ctx_manager
     ProxyHandler.proxy_config = config
 
-    server = HTTPServer((args.host, args.port), ProxyHandler)
+    server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
 
     auth_mode = "API key" if config.api_key else "passthrough (client auth)"
     config_note = f"\n  Config:     {args.config}" if args.config else ""

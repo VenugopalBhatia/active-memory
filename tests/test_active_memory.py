@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import subprocess
 import sys
 import tempfile
@@ -138,7 +139,7 @@ class TestCoreUtilities(unittest.TestCase):
             "print(','.join(f'{x:.6f}' for x in vec))"
         )
         common = {
-            "cwd": "/Users/venugopalbhatia/Documents/active_memory_v0.1",
+            "cwd": str(Path(__file__).resolve().parents[1]),
             "text": True,
         }
         first = subprocess.check_output([sys.executable, "-c", script], **common).strip()
@@ -175,6 +176,14 @@ class TestScorerBehavior(unittest.TestCase):
         query = embedder.embed(["helper dependency"])[0]
         self.assertGreater(scorer.score(related, query), scorer.score(unrelated, query))
 
+    def test_score_without_query_does_not_get_neutral_relevance_boost(self) -> None:
+        scorer = Scorer()
+        t = KVTuple(key_text="x", value_text="y")
+        t.last_accessed = time.time() - 86_400
+        t.hit_count = 0
+
+        self.assertLess(scorer.score(t), 0.10)
+
 
 class TestSemanticBTreeBehavior(unittest.TestCase):
     def test_query_prefers_semantically_matching_tuple(self) -> None:
@@ -205,6 +214,21 @@ class TestSemanticBTreeBehavior(unittest.TestCase):
 
         self.assertGreaterEqual(len(evicted), 1)
         self.assertIn(hot.id, {t.id for t in tree.all_tuples()})
+
+    def test_prune_evicts_cold_irrelevant_tuples(self) -> None:
+        tree, embedder, _ = make_tree(threshold=0.2)
+        tree.insert("database", "postgres")
+        tree.insert("weather", "sunny")
+        for t in tree.all_tuples():
+            t.last_accessed = time.time() - 3600
+            t.hit_count = 0
+
+        query = embedder.embed(["database"])[0]
+        evicted = tree.prune(query)
+
+        evicted_keys = {t.key_text for t in evicted}
+        self.assertIn("weather", evicted_keys)
+        self.assertNotIn("database", evicted_keys)
 
     def test_compress_cold_subtrees_replaces_raw_tuples_with_summary(self) -> None:
         tree, embedder, _ = make_tree(max_tuples=3, threshold=0.35)
@@ -749,6 +773,34 @@ class TestContextManagerAndProxyBehavior(unittest.TestCase):
         handle_config_update.assert_not_called()
         proxy_passthrough.assert_not_called()
 
+    def test_process_messages_is_thread_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ContextManager(
+                ProxyConfig(
+                    token_budget=1_000,
+                    embedder_provider="hash",
+                    state_dir=tmp,
+                )
+            )
+            errors: list[Exception] = []
+
+            def worker(i: int) -> None:
+                try:
+                    manager.process_messages(
+                        [{"role": "user", "content": f"message {i} about database choice"}]
+                    )
+                except Exception as exc:  # pragma: no cover - assertion target
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertFalse(errors)
+            self.assertGreater(manager.tree.size, 0)
+
 
 class TestAssemblerAndGroundingBehavior(unittest.TestCase):
     def test_assembler_counts_text_blocks_in_pinned_messages(self) -> None:
@@ -882,7 +934,7 @@ class _FakeGeminiClient:
         return _FakeGeminiResponse()
 
 
-class TestModelClientProviders(unittest.TestCase):
+class TestModelClientProviderDefaults(unittest.TestCase):
     def test_provider_defaults_cover_new_providers(self) -> None:
         self.assertEqual(DEFAULT_PROVIDER_MODELS["gemini"], "gemini-2.5-flash")
         self.assertEqual(DEFAULT_PROVIDER_MODELS["codex"], "gpt-5-codex")
