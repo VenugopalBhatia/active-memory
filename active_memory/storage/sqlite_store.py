@@ -201,6 +201,20 @@ class SQLiteMemoryStore:
                 (session_id, namespace, json.dumps(list(memory_ids)), input_tokens, _dt(created_at), json.dumps(metadata or {}, sort_keys=True)),
             )
 
+    def complete_context_assembly(self, session_id: str, namespace: str, memory_ids: Sequence[str], input_tokens: int, created_at: datetime, metadata: dict | None = None) -> None:
+        """Atomically update inclusion frequency and record the completed assembly."""
+        with self.transaction() as connection:
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                connection.execute(
+                    f"UPDATE memories SET inclusion_count=inclusion_count+1, last_included_at=?, updated_at=? WHERE id IN ({placeholders})",
+                    [_dt(created_at), _dt(created_at), *memory_ids],
+                )
+            connection.execute(
+                "INSERT INTO context_assembly_events(session_id, namespace, included_memory_ids_json, input_tokens, created_at, metadata_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, namespace, json.dumps(list(memory_ids)), input_tokens, _dt(created_at), json.dumps(metadata or {}, sort_keys=True)),
+            )
+
     def delete_memory(self, memory_id: str) -> int:
         with self.transaction() as connection:
             return connection.execute("UPDATE memories SET status='deleted' WHERE id=?", (memory_id,)).rowcount
