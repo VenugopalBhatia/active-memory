@@ -121,19 +121,19 @@ class SQLiteMemoryStore:
 
     def get_active_memories(self, namespace: str, filters: MemoryFilters | None = None) -> list[Memory]:
         filters = filters or MemoryFilters()
-        clauses = ["namespace = ?"]
+        clauses = ["m.namespace = ?"]
         params: list[object] = [namespace]
         if filters.session_id is not None:
-            clauses.append("session_id = ?")
+            clauses.append("m.session_id = ?")
             params.append(filters.session_id)
         for column, values in (("memory_type", filters.memory_types), ("trust_level", filters.trust_levels), ("status", filters.statuses)):
             if values:
                 placeholders = ",".join("?" for _ in values)
-                clauses.append(f"{column} IN ({placeholders})")
+                clauses.append(f"m.{column} IN ({placeholders})")
                 params.extend(sorted(values))
         if filters.valid_at:
             timestamp = _dt(filters.valid_at)
-            clauses.extend(["(valid_from IS NULL OR valid_from <= ?)", "(valid_until IS NULL OR valid_until > ?)"])
+            clauses.extend(["(m.valid_from IS NULL OR m.valid_from <= ?)", "(m.valid_until IS NULL OR m.valid_until > ?)"])
             params.extend([timestamp, timestamp])
         rows = self._connection.execute(
             f"SELECT m.* FROM memories m JOIN messages msg ON msg.id=m.source_message_id WHERE {' AND '.join(clauses)} ORDER BY m.created_at, m.id",
@@ -226,4 +226,3 @@ class SQLiteMemoryStore:
     @staticmethod
     def _edge(row: sqlite3.Row) -> MemoryEdge:
         return MemoryEdge(row["source_id"], row["target_id"], row["edge_type"], row["weight"], _parse_dt(row["created_at"]), json.loads(row["metadata_json"]))  # type: ignore[arg-type]
-
