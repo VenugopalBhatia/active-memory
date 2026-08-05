@@ -19,6 +19,7 @@ from .scoring import (
     relevance_score,
     score_stage_one,
 )
+from .retriever import FinalWeights, RetrievalConfig, TwoPassRetriever
 
 __all__ = [
     "Candidate", "ExactCandidateRetriever", "EmbeddingProvider",
@@ -27,5 +28,5 @@ __all__ = [
     "create_embedding_provider", "embed_normalized", "normalize_vector",
     "ScoringPolicy", "StageOneWeights", "relevance_score", "recency_score",
     "frequency_score", "score_stage_one",
+    "FinalWeights", "RetrievalConfig", "TwoPassRetriever",
 ]
-
