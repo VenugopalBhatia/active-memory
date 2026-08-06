@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any
 
 from active_memory.ingestion.classification import classify_segment
 from active_memory.ingestion.deduplication import find_duplicate

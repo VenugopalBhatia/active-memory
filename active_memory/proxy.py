@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Anthropic-compatible HTTP proxy backed by persistent semantic memory."""
 
 from __future__ import annotations
@@ -11,7 +10,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -69,7 +68,7 @@ class MemoryEngine:
 
     @staticmethod
     def _event_id(session_id: str, ordinal: int, role: str, content: str) -> str:
-        digest = hashlib.sha256(f"{session_id}\0{ordinal}\0{role}\0{content}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{session_id}\0{ordinal}\0{role}\0{content}".encode()).hexdigest()
         return f"msg_{digest}"
 
     @staticmethod
@@ -103,14 +102,15 @@ class MemoryEngine:
             latest_user = next((content_to_text(message.get("content", "")) for message in reversed(messages) if isinstance(message, dict) and message.get("role") == "user"), "")
             if not latest_user:
                 return original, RequestState(session_id, namespace, len(messages))
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             ranked = self.retriever.retrieve(latest_user, namespace, now)
             assembled = self.assembler.assemble(
                 session_id=session_id, namespace=namespace, system=system,
                 tools=request.get("tools"), messages=messages, ranked_memories=ranked, assembled_at=now,
             )
             transformed = copy.deepcopy(request)
-            transformed["system"] = assembled.system
+            if assembled.system or "system" in transformed:
+                transformed["system"] = assembled.system
             transformed["messages"] = assembled.messages
             self.last_trace = {
                 "status": "assembled", "session_id": session_id, "namespace": namespace,

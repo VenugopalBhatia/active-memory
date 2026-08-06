@@ -6,9 +6,8 @@ import hashlib
 import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
-
 
 MESSAGE_ROLES = {"user", "assistant", "system", "tool"}
 MEMORY_TYPES = {
@@ -27,7 +26,7 @@ EDGE_TYPES = {
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def new_id(prefix: str) -> str:

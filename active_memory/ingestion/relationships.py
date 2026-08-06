@@ -7,7 +7,6 @@ from datetime import datetime
 
 from active_memory.models import Memory, MemoryEdge
 
-
 DEFAULT_EDGE_WEIGHTS: Mapping[str, float] = {
     "resolves": 1.00,
     "supersedes": 1.00,

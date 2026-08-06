@@ -6,10 +6,10 @@ import json
 import sqlite3
 import struct
 import threading
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
 
 from active_memory.models import Memory, MemoryEdge, MemoryFilters, Message
 from active_memory.storage.migrations import migrate
@@ -156,9 +156,7 @@ class SQLiteMemoryStore:
             return False
         if filters.file_path and memory.metadata.get("file_path") != filters.file_path:
             return False
-        if filters.entity and filters.entity not in memory.metadata.get("entities", []):
-            return False
-        return True
+        return not (filters.entity and filters.entity not in memory.metadata.get("entities", []))
 
     def get_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]:
         if not memory_ids:

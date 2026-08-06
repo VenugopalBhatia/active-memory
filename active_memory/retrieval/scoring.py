@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Mapping, Sequence
 
 from active_memory.models import Memory, RetrievalResult
 from active_memory.retrieval.candidates import Candidate

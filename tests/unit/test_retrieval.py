@@ -4,7 +4,11 @@ from active_memory.context.tokenizer import ApproximateTokenCounter
 from active_memory.ingestion.writer import MemoryWriter
 from active_memory.models import Memory, MemoryFilters, new_id
 from active_memory.retrieval.candidates import ExactCandidateRetriever
-from active_memory.retrieval.embeddings import DeterministicTestEmbeddingProvider, EmbeddingDimensionError, embed_normalized
+from active_memory.retrieval.embeddings import (
+    DeterministicTestEmbeddingProvider,
+    EmbeddingDimensionError,
+    embed_normalized,
+)
 from active_memory.storage.sqlite_store import SQLiteMemoryStore
 
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any
 
 from active_memory.context.budgeting import BudgetConfig, ContextBudgetExceeded
 from active_memory.context.formatter import content_to_text, format_memory, format_memory_context, message_to_text

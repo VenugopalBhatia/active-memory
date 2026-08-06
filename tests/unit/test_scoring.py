@@ -6,7 +6,14 @@ import pytest
 
 from active_memory.models import Memory, utc_now
 from active_memory.retrieval.candidates import Candidate
-from active_memory.retrieval.scoring import ScoringPolicy, StageOneWeights, frequency_score, recency_score, relevance_score, score_stage_one
+from active_memory.retrieval.scoring import (
+    ScoringPolicy,
+    StageOneWeights,
+    frequency_score,
+    recency_score,
+    relevance_score,
+    score_stage_one,
+)
 
 
 def memory(memory_id: str, *, age_days: int = 0, inclusions: int = 0, memory_type: str = "fact") -> Memory:

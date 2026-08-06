@@ -16,7 +16,6 @@ import ast
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 @dataclass
@@ -42,7 +41,7 @@ class CodeParser:
         filepath = Path(filepath)
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except OSError:
             return []
         return self.parse_source(source, str(filepath))
 
@@ -87,7 +86,6 @@ class CodeParser:
         chunks: list[CodeChunk] = []
 
         # Class-level chunk (docstring + class vars, no method bodies)
-        class_header = self._get_source_segment(node, lines)
         decorators = [self._decorator_name(d) for d in node.decorator_list]
         docstring = ast.get_docstring(node)
 
@@ -176,14 +174,15 @@ class CodeParser:
         """Extract module-level statements (imports, constants)."""
         parts: list[str] = []
         for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign)):
                 parts.append(self._get_source_segment(node, lines))
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                parts.append(self._get_source_segment(node, lines))
-            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            elif (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
                 # Module docstring
-                if isinstance(node.value.value, str):
-                    parts.append(self._get_source_segment(node, lines))
+                parts.append(self._get_source_segment(node, lines))
         return "\n".join(parts) if parts else ""
 
     def _resolve_call_graph(self, chunks: list[CodeChunk]) -> None:
@@ -201,9 +200,8 @@ class CodeParser:
         for chunk in chunks:
             for call_name in chunk.calls:
                 target = name_to_chunk.get(call_name)
-                if target and target.name != chunk.name:
-                    if chunk.name not in target.called_by:
-                        target.called_by.append(chunk.name)
+                if target and target.name != chunk.name and chunk.name not in target.called_by:
+                    target.called_by.append(chunk.name)
 
     @staticmethod
     def _get_source_segment(node: ast.AST, lines: list[str]) -> str:
@@ -272,7 +270,7 @@ def parse_code_file(filepath: str | Path) -> list[CodeChunk]:
         # Generic line-based chunking
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except OSError:
             return []
         return CodeParser._fallback_chunk(source, str(filepath))
 

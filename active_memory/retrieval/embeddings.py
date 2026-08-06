@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import numpy as np
 
@@ -57,7 +57,7 @@ class DeterministicTestEmbeddingProvider:
 
     @property
     def dimension(self) -> int:
-        return self._dimension
+        return int(self._dimension)
 
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
@@ -87,7 +87,7 @@ class LocalSentenceTransformerProvider:
 
     @property
     def dimension(self) -> int:
-        return self._dimension
+        return int(self._dimension)
 
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
         vectors = self._client.encode(list(texts), normalize_embeddings=False)
@@ -97,7 +97,10 @@ class LocalSentenceTransformerProvider:
 class OpenAIEmbeddingProvider:
     semantic = True
 
-    _KNOWN_DIMENSIONS = {"text-embedding-3-small": 1536, "text-embedding-3-large": 3072}
+    _KNOWN_DIMENSIONS: ClassVar[dict[str, int]] = {
+        "text-embedding-3-small": 1536,
+        "text-embedding-3-large": 3072,
+    }
 
     def __init__(self, model: str = "text-embedding-3-small", *, client: Any | None = None, dimension: int | None = None) -> None:
         if client is None:
@@ -106,9 +109,10 @@ class OpenAIEmbeddingProvider:
             client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         self.model = model
         self._client = client
-        self._dimension = dimension or self._KNOWN_DIMENSIONS.get(model)
-        if self._dimension is None:
+        resolved_dimension = dimension or self._KNOWN_DIMENSIONS.get(model)
+        if resolved_dimension is None:
             raise ValueError("dimension is required for unknown OpenAI embedding models")
+        self._dimension: int = resolved_dimension
 
     @property
     def dimension(self) -> int:
@@ -128,4 +132,3 @@ def create_embedding_provider(provider: str = "local", *, model: str | None = No
     if chosen in {"test", "lexical", "hash"}:
         return DeterministicTestEmbeddingProvider(dimension)
     raise ValueError(f"unknown embedding provider: {provider}")
-

@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-
 DEFAULT_PATTERNS = (
     r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+",
     r"(?i)(password\s*[:=]\s*)[^\s,;]+",

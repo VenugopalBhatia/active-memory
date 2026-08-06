@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.resources import files
 
 SCHEMA_VERSION = 1
@@ -18,7 +18,7 @@ def migrate(connection: sqlite3.Connection) -> None:
     if current < SCHEMA_VERSION:
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-            (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+            (SCHEMA_VERSION, datetime.now(UTC).isoformat()),
         )
         connection.commit()
 

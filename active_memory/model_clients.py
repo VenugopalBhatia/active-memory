@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-
 DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o-mini",
@@ -120,7 +119,7 @@ def _read_claude_code_oauth() -> dict[str, Any] | None:
                 "-s", "Claude Code-credentials",
                 "-w",
             ],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         if result.returncode != 0:
             return None

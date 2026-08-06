@@ -103,10 +103,10 @@ class ActiveMemoryConfig:
         return BudgetConfig(**{name: getattr(self.budget, name) for name in BudgetSettings.__dataclass_fields__})
 
 
-def _section(data: dict[str, Any], key: str, cls: type) -> Any:
+def _section(data: dict[str, Any], key: str, cls: type[Any]) -> Any:
     values = data.get(key, {})
     if not isinstance(values, dict):
-        raise ValueError(f"configuration section {key!r} must be an object")
+        raise TypeError(f"configuration section {key!r} must be an object")
     unknown = set(values) - set(cls.__dataclass_fields__)
     if unknown:
         raise ValueError(f"unknown {key} configuration fields: {', '.join(sorted(unknown))}")
@@ -140,6 +140,5 @@ def load_config(path: str | Path | None = None) -> ActiveMemoryConfig:
     else:
         data = json.loads(text)
     if not isinstance(data, dict):
-        raise ValueError("configuration root must be an object")
+        raise TypeError("configuration root must be an object")
     return config_from_dict(data)
-

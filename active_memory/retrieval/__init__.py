@@ -11,6 +11,7 @@ from .embeddings import (
     embed_normalized,
     normalize_vector,
 )
+from .retriever import FinalWeights, RetrievalConfig, TwoPassRetriever
 from .scoring import (
     ScoringPolicy,
     StageOneWeights,
@@ -19,14 +20,25 @@ from .scoring import (
     relevance_score,
     score_stage_one,
 )
-from .retriever import FinalWeights, RetrievalConfig, TwoPassRetriever
 
 __all__ = [
-    "Candidate", "ExactCandidateRetriever", "EmbeddingProvider",
-    "DeterministicTestEmbeddingProvider", "LocalSentenceTransformerProvider",
-    "OpenAIEmbeddingProvider", "EmbeddingDimensionError",
-    "create_embedding_provider", "embed_normalized", "normalize_vector",
-    "ScoringPolicy", "StageOneWeights", "relevance_score", "recency_score",
-    "frequency_score", "score_stage_one",
-    "FinalWeights", "RetrievalConfig", "TwoPassRetriever",
+    "Candidate",
+    "DeterministicTestEmbeddingProvider",
+    "EmbeddingDimensionError",
+    "EmbeddingProvider",
+    "ExactCandidateRetriever",
+    "FinalWeights",
+    "LocalSentenceTransformerProvider",
+    "OpenAIEmbeddingProvider",
+    "RetrievalConfig",
+    "ScoringPolicy",
+    "StageOneWeights",
+    "TwoPassRetriever",
+    "create_embedding_provider",
+    "embed_normalized",
+    "frequency_score",
+    "normalize_vector",
+    "recency_score",
+    "relevance_score",
+    "score_stage_one",
 ]

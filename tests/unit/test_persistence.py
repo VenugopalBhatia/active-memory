@@ -88,3 +88,22 @@ def test_namespace_isolation_and_supersession(tmp_path) -> None:
     assert [m.id for m in store.get_active_memories("beta")] == [other.id]
     assert store.get_neighbors([new.id])[0].edge_type == "supersedes"
     store.close()
+
+
+def test_explicit_privacy_deletion_is_physical(tmp_path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.db")
+    writer = MemoryWriter(store, ApproximateTokenCounter())
+    session_message = writer.make_message("delete-session", "user", "Decision: use SQLite.")
+    session_memory = make_memory(session_message, "keep-namespace")
+    writer.write(session_message, [session_memory])
+    namespace_message = writer.make_message("other-session", "user", "Decision: use PostgreSQL.")
+    namespace_memory = make_memory(namespace_message, "delete-namespace")
+    writer.write(namespace_message, [namespace_memory])
+
+    assert store.delete_session("delete-session") == 1
+    assert store.get_message(session_message.id) is None
+    assert store.get_memories_by_ids([session_memory.id]) == []
+    assert store.delete_namespace("delete-namespace") == 1
+    assert store.get_message(namespace_message.id) is None
+    assert store.get_memories_by_ids([namespace_memory.id]) == []
+    store.close()

@@ -5,7 +5,6 @@ from __future__ import annotations
 from active_memory.retrieval.retriever import FinalWeights
 from active_memory.retrieval.scoring import ScoringPolicy, StageOneWeights
 
-
 ABLATIONS = {
     "full": (StageOneWeights(), FinalWeights()),
     "minus_affinity": (StageOneWeights(), FinalWeights(0.6470588235, 0.2352941176, 0.1176470589, 0.0)),

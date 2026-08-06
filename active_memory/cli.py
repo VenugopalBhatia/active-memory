@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 
 from active_memory.config import load_config
+from active_memory.models import utc_now
 from active_memory.retrieval import TwoPassRetriever, create_embedding_provider
 from active_memory.storage.sqlite_store import SQLiteMemoryStore
-from active_memory.models import utc_now
 
 
 def _runtime(config_path: str | None):
@@ -91,8 +91,4 @@ def main() -> None:
             print(f"deleted {path}")
             return
     finally:
-        try:
-            store.close()
-        except Exception:
-            pass
-
+        store.close()
