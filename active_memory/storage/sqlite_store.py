@@ -225,17 +225,21 @@ class SQLiteMemoryStore:
 
     def delete_memory(self, memory_id: str) -> int:
         with self.transaction() as connection:
-            return connection.execute("UPDATE memories SET status='deleted' WHERE id=?", (memory_id,)).rowcount
+            return connection.execute("DELETE FROM memories WHERE id=?", (memory_id,)).rowcount
 
     def delete_session(self, session_id: str) -> int:
         with self.transaction() as connection:
-            count = connection.execute("UPDATE memories SET status='deleted' WHERE session_id=?", (session_id,)).rowcount
-            connection.execute("DELETE FROM messages WHERE session_id=? AND NOT EXISTS (SELECT 1 FROM memories WHERE source_message_id=messages.id)", (session_id,))
+            count = connection.execute("SELECT COUNT(*) FROM memories WHERE session_id=?", (session_id,)).fetchone()[0]
+            connection.execute("DELETE FROM memories WHERE session_id=?", (session_id,))
+            connection.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             return count
 
     def delete_namespace(self, namespace: str) -> int:
         with self.transaction() as connection:
-            return connection.execute("UPDATE memories SET status='deleted' WHERE namespace=?", (namespace,)).rowcount
+            count = connection.execute("SELECT COUNT(*) FROM memories WHERE namespace=?", (namespace,)).fetchone()[0]
+            connection.execute("DELETE FROM memories WHERE namespace=?", (namespace,))
+            connection.execute("DELETE FROM messages WHERE NOT EXISTS (SELECT 1 FROM memories WHERE source_message_id=messages.id)")
+            return count
 
     @staticmethod
     def _message(row: sqlite3.Row) -> Message:

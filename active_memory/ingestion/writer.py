@@ -41,7 +41,7 @@ class MemoryWriter:
 class MemoryIngestor:
     """Explicit redaction, segmentation, classification, dedupe, and write pipeline."""
 
-    def __init__(self, store: SQLiteMemoryStore, embedding_provider: EmbeddingProvider, token_counter: Any, *, minimum_segment_tokens: int = 12, maximum_segment_tokens: int = 500, semantic_duplicate_threshold: float = 0.97, storage_enabled: bool = True, redactor: SecretRedactor | None = None) -> None:
+    def __init__(self, store: SQLiteMemoryStore, embedding_provider: EmbeddingProvider, token_counter: Any, *, minimum_segment_tokens: int = 12, maximum_segment_tokens: int = 500, semantic_duplicate_threshold: float = 0.97, storage_enabled: bool = True, store_assistant_generated: bool = True, redactor: SecretRedactor | None = None) -> None:
         self.store = store
         self.embedding_provider = embedding_provider
         self.token_counter = token_counter
@@ -50,6 +50,7 @@ class MemoryIngestor:
         self.maximum_segment_tokens = maximum_segment_tokens
         self.semantic_duplicate_threshold = semantic_duplicate_threshold
         self.storage_enabled = storage_enabled
+        self.store_assistant_generated = store_assistant_generated
         self.redactor = redactor or SecretRedactor()
 
     def ingest(self, session_id: str, namespace: str, role: str, content: str, *, message_id: str | None = None, created_at: datetime | None = None, metadata: dict[str, Any] | None = None) -> tuple[Message | None, list[Memory]]:
@@ -63,7 +64,11 @@ class MemoryIngestor:
         message = self.writer.make_message(session_id, role, redacted, created_at=created_at, metadata=event_metadata, message_id=message_id)
         segments = segment_message(redacted, self.token_counter, minimum_tokens=self.minimum_segment_tokens, maximum_tokens=self.maximum_segment_tokens)
         classified = [(segment, classify_segment(role, segment.content, {**segment.metadata, "source_role": role, "start_offset": segment.start_offset, "end_offset": segment.end_offset})) for segment in segments]
-        eligible = [(segment, classification) for segment, classification in classified if classification is not None]
+        eligible = [
+            (segment, classification) for segment, classification in classified
+            if classification is not None
+            and (self.store_assistant_generated or classification.trust_level != "assistant_generated")
+        ]
         try:
             embeddings = embed_normalized(self.embedding_provider, [segment.content for segment, _ in eligible])
         except Exception:

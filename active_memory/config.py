@@ -1,155 +1,145 @@
-"""Unified config file loading for all active-memory interfaces.
-
-Supports a single JSON config file that works across proxy, chat CLI,
-and MCP server.  Priority: dataclass defaults < config file < CLI flags.
-
-Auto-discovers ~/.active-memory/config.json when no explicit path is given.
-"""
+"""Typed application configuration loaded from JSON or optional YAML."""
 
 from __future__ import annotations
 
-import dataclasses
 import json
-import sys
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any
 
-_DEFAULT_CONFIG_PATH = Path.home() / ".active-memory" / "config.json"
-
-# Top-level convenience keys that map into assembler fields
-_ASSEMBLER_ALIASES = {
-    "budget": "total_budget",
-    "recency_window": "recency_window",
-    "pinned_reserve": "pinned_reserve",
-}
+from active_memory.context import BudgetConfig
+from active_memory.retrieval import FinalWeights, RetrievalConfig
+from active_memory.retrieval.scoring import ScoringPolicy, StageOneWeights
 
 
-def load_config(
-    config_path: str | None = None,
-    *,
-    auto_discover: bool = True,
-) -> dict[str, Any]:
-    """Load a JSON config file and return it as a plain dict.
+@dataclass(frozen=True, slots=True)
+class StorageSettings:
+    backend: str = "sqlite"
+    path: str = "~/.active-memory/memory.db"
 
-    Resolution:
-      1. If *config_path* is given, load that file (error if missing).
-      2. Else if *auto_discover* and ~/.active-memory/config.json exists, use it.
-      3. Otherwise return {}.
-    """
-    if config_path is not None:
-        p = Path(config_path)
-        if not p.exists():
-            print(f"Error: Config file not found: {config_path}", file=sys.stderr)
-            sys.exit(1)
-        return json.loads(p.read_text())
-
-    if auto_discover and _DEFAULT_CONFIG_PATH.exists():
-        return json.loads(_DEFAULT_CONFIG_PATH.read_text())
-
-    return {}
+    def __post_init__(self) -> None:
+        if self.backend != "sqlite":
+            raise ValueError("only the sqlite backend is currently supported")
 
 
-def _coerce(value: Any, target_type: type) -> Any:
-    """Coerce a JSON value to the target type."""
-    if target_type is bool:
-        return bool(value)
-    if target_type is int:
-        return int(value)
-    if target_type is float:
-        return float(value)
-    if target_type is str:
-        return str(value)
-    return value
+@dataclass(frozen=True, slots=True)
+class EmbeddingSettings:
+    provider: str = "local"
+    model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    batch_size: int = 32
 
 
-def apply_overrides(dc_instance: Any, overrides: dict[str, Any]) -> None:
-    """Apply dict overrides to a dataclass instance with type coercion.
-
-    Skips keys that don't correspond to fields on the dataclass.
-    """
-    hints = get_type_hints(type(dc_instance))
-    for f in dataclasses.fields(dc_instance):
-        if f.name in overrides:
-            setattr(dc_instance, f.name, _coerce(overrides[f.name], hints[f.name]))
+@dataclass(frozen=True, slots=True)
+class RetrievalSettings:
+    candidate_limit: int = 80
+    seed_limit: int = 6
+    neighbor_limit: int = 30
+    result_limit: int = 20
+    minimum_relevance: float = 0.20
 
 
-def build_scoring_config(raw: dict[str, Any]) -> "ScoringConfig":
-    """Build a ScoringConfig from the 'scoring' section of a config dict."""
-    from .scoring import ScoringConfig
+@dataclass(frozen=True, slots=True)
+class ScoringSettings:
+    stage_one_relevance_weight: float = 0.65
+    stage_one_recency_weight: float = 0.25
+    stage_one_frequency_weight: float = 0.10
+    relevance_weight: float = 0.55
+    recency_weight: float = 0.20
+    frequency_weight: float = 0.10
+    affinity_weight: float = 0.15
 
-    cfg = ScoringConfig()
-    section = raw.get("scoring", {})
-    if section:
-        apply_overrides(cfg, section)
-    return cfg
-
-
-def build_btree_config(raw: dict[str, Any]) -> "BTreeConfig":
-    """Build a BTreeConfig from the 'btree' section of a config dict."""
-    from .btree import BTreeConfig
-
-    cfg = BTreeConfig()
-    section = raw.get("btree", {})
-    if section:
-        apply_overrides(cfg, section)
-    return cfg
+    def __post_init__(self) -> None:
+        if not math.isclose(self.stage_one_relevance_weight + self.stage_one_recency_weight + self.stage_one_frequency_weight, 1.0, abs_tol=1e-9):
+            raise ValueError("stage-one scoring weights must sum to 1.0")
+        if not math.isclose(self.relevance_weight + self.recency_weight + self.frequency_weight + self.affinity_weight, 1.0, abs_tol=1e-9):
+            raise ValueError("final scoring weights must sum to 1.0")
 
 
-def build_assembler_config(raw: dict[str, Any]) -> "AssemblerConfig":
-    """Build an AssemblerConfig from config dict.
-
-    Reads the 'assembler' section, with fallback to top-level convenience
-    keys ('budget' -> total_budget, 'recency_window', 'pinned_reserve').
-    """
-    from .assembler import AssemblerConfig
-
-    cfg = AssemblerConfig()
-    section = raw.get("assembler", {})
-
-    # Apply top-level convenience aliases first (lower priority)
-    for alias, field_name in _ASSEMBLER_ALIASES.items():
-        if alias in raw and field_name not in section:
-            section[field_name] = raw[alias]
-
-    if section:
-        apply_overrides(cfg, section)
-    return cfg
+@dataclass(frozen=True, slots=True)
+class BudgetSettings:
+    model_context_limit: int = 200_000
+    reserved_response_tokens: int = 8_000
+    safety_margin_tokens: int = 2_000
+    recent_turn_fraction: float = 0.35
+    memory_fraction: float = 0.35
+    tool_context_fraction: float = 0.20
+    recent_message_limit: int = 8
 
 
-def build_grounding_config(raw: dict[str, Any]) -> "GroundingConfig":
-    """Build a GroundingConfig from the 'grounding' section of a config dict."""
-    from .grounding import GroundingConfig
-
-    cfg = GroundingConfig()
-    section = raw.get("grounding", {})
-    if section:
-        apply_overrides(cfg, section)
-    return cfg
+@dataclass(frozen=True, slots=True)
+class MemorySettings:
+    minimum_segment_tokens: int = 12
+    maximum_segment_tokens: int = 500
+    default_namespace: str = "global"
+    store_assistant_generated: bool = True
+    storage_enabled: bool = True
 
 
-def build_middleware_config(raw: dict[str, Any]) -> "MiddlewareConfig":
-    """Build a complete MiddlewareConfig from a config dict.
+@dataclass(frozen=True, slots=True)
+class ProxySettings:
+    upstream_url: str = "https://api.anthropic.com"
+    host: str = "127.0.0.1"
+    port: int = 8080
+    strict_memory: bool = False
 
-    Populates nested sub-configs from their respective sections, and
-    reads top-level keys for shared fields (model, budget, etc.).
-    """
-    from .middleware import MiddlewareConfig
 
-    cfg = MiddlewareConfig(
-        scoring=build_scoring_config(raw),
-        btree=build_btree_config(raw),
-        assembler=build_assembler_config(raw),
-        grounding=build_grounding_config(raw),
+@dataclass(frozen=True, slots=True)
+class ActiveMemoryConfig:
+    storage: StorageSettings = field(default_factory=StorageSettings)
+    embeddings: EmbeddingSettings = field(default_factory=EmbeddingSettings)
+    retrieval: RetrievalSettings = field(default_factory=RetrievalSettings)
+    scoring: ScoringSettings = field(default_factory=ScoringSettings)
+    budget: BudgetSettings = field(default_factory=BudgetSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
+    proxy: ProxySettings = field(default_factory=ProxySettings)
+
+    def retrieval_config(self) -> RetrievalConfig:
+        stage = StageOneWeights(self.scoring.stage_one_relevance_weight, self.scoring.stage_one_recency_weight, self.scoring.stage_one_frequency_weight)
+        final = FinalWeights(self.scoring.relevance_weight, self.scoring.recency_weight, self.scoring.frequency_weight, self.scoring.affinity_weight)
+        return RetrievalConfig(self.retrieval.candidate_limit, self.retrieval.seed_limit, self.retrieval.neighbor_limit, self.retrieval.result_limit, self.retrieval.minimum_relevance, ScoringPolicy(stage_one=stage), final)
+
+    def budget_config(self) -> BudgetConfig:
+        return BudgetConfig(**{name: getattr(self.budget, name) for name in BudgetSettings.__dataclass_fields__})
+
+
+def _section(data: dict[str, Any], key: str, cls: type) -> Any:
+    values = data.get(key, {})
+    if not isinstance(values, dict):
+        raise ValueError(f"configuration section {key!r} must be an object")
+    unknown = set(values) - set(cls.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"unknown {key} configuration fields: {', '.join(sorted(unknown))}")
+    return cls(**values)
+
+
+def config_from_dict(data: dict[str, Any]) -> ActiveMemoryConfig:
+    known = {"storage", "embeddings", "retrieval", "scoring", "budget", "memory", "proxy"}
+    unknown = set(data) - known
+    if unknown:
+        raise ValueError(f"unknown configuration sections: {', '.join(sorted(unknown))}")
+    return ActiveMemoryConfig(
+        _section(data, "storage", StorageSettings), _section(data, "embeddings", EmbeddingSettings),
+        _section(data, "retrieval", RetrievalSettings), _section(data, "scoring", ScoringSettings),
+        _section(data, "budget", BudgetSettings), _section(data, "memory", MemorySettings),
+        _section(data, "proxy", ProxySettings),
     )
 
-    # Apply top-level middleware fields
-    top_level = {
-        k: v for k, v in raw.items()
-        if k in ("model", "system_prompt", "max_tokens",
-                 "prune_interval", "compress_interval",
-                 "auto_ingest_responses")
-    }
-    if top_level:
-        apply_overrides(cfg, top_level)
 
-    return cfg
+def load_config(path: str | Path | None = None) -> ActiveMemoryConfig:
+    config_path = Path(path).expanduser() if path else Path("~/.active-memory/config.json").expanduser()
+    if not config_path.exists():
+        return ActiveMemoryConfig()
+    text = config_path.read_text(encoding="utf-8")
+    if config_path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise RuntimeError("PyYAML is required to load YAML configuration") from exc
+        data = yaml.safe_load(text) or {}
+    else:
+        data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("configuration root must be an object")
+    return config_from_dict(data)
+
