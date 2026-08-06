@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "active-memory"
 version = "0.1.0a0"
-description = "Active memory management for long LLM context windows."
+description = "Local, inspectable semantic memory and context assembly for LLM agents."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "Venugopal Bhatia" }
 ]
@@ -16,7 +17,6 @@ keywords = ["llm", "context-window", "memory", "proxy", "claude", "anthropic"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -43,22 +43,33 @@ local = [
 dev = [
   "anthropic>=0.34.0",
   "pytest>=8.0",
+  "ruff>=0.9.0",
+  "mypy>=1.13.0",
 ]
 
 [project.scripts]
-active-memory = "active_memory.proxy:main"
-active-memory-chat = "active_memory.cli:main"
-active-memory-eval = "active_memory.eval:main"
-active-memory-live-bench = "active_memory.live_ab_bench:main"
-active-memory-long-context-bench = "active_memory.long_context_bench:main"
-active-memory-proxy-live-bench = "active_memory.proxy_live_bench:main"
-active-memory-mcp = "active_memory.mcp_server:main"
+active-memory = "active_memory.cli:main"
+active-memory-proxy = "active_memory.proxy:main"
+active-memory-eval = "active_memory.evaluation.end_to_end:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["active_memory"]
+include = ["active_memory*"]
+
+[tool.setuptools.package-data]
+"active_memory.storage" = ["schema.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_ignores = true
+ignore_missing_imports = true
