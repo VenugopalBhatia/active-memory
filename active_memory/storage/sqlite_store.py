@@ -87,12 +87,20 @@ class SQLiteMemoryStore:
              memory.inclusion_count, _dt(memory.last_included_at), json.dumps(memory.metadata, sort_keys=True)),
         )
 
-    def add_message_and_memories(self, message: Message, memories: Sequence[Memory], edges: Sequence[MemoryEdge] = ()) -> None:
+    def add_message_and_memories(self, message: Message, memories: Sequence[Memory], edges: Sequence[MemoryEdge] = (), supersessions: Sequence[tuple[str, str, datetime]] = ()) -> None:
         with self.transaction() as connection:
             self._insert_message(connection, message)
             for memory in memories:
                 self._insert_memory(connection, memory)
             self._insert_edges(connection, edges)
+            for old_memory_id, new_memory_id, superseded_at in supersessions:
+                cursor = connection.execute(
+                    "UPDATE memories SET status='superseded', valid_until=?, superseded_by=?, updated_at=? WHERE id=? AND status='active'",
+                    (_dt(superseded_at), new_memory_id, _dt(superseded_at), old_memory_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"active memory not found: {old_memory_id}")
+                self._insert_edges(connection, [MemoryEdge(new_memory_id, old_memory_id, "supersedes", 1.0, superseded_at)])
 
     def add_edges(self, edges: Sequence[MemoryEdge]) -> None:
         with self.transaction() as connection:
